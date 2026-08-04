@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+
+data/*.json
+data/*.json.tmp
+data/dhan_scrip_master.csv
+
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+*.log

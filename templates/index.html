@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Koju Dhan Algo</title>
+  <link rel="stylesheet" href="/static/app.css?v=20260803-cache-report">
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <h1>Koju Dhan Algo</h1>
+        <p>DhanHQ intraday execution for 1m and 5m opening momentum setups</p>
+      </div>
+      <div class="status-strip">
+        <span id="runState" class="pill">Stopped</span>
+        <span id="feedState" class="pill muted">Feed</span>
+        <span id="orderState" class="pill muted">Orders</span>
+      </div>
+    </header>
+
+    <section class="controls">
+      <div class="panel credentials">
+        <h2>Credentials</h2>
+        <label>Dhan client ID <input id="clientId" autocomplete="off"></label>
+        <label>Dhan access token <input id="accessToken" type="password" autocomplete="off"></label>
+        <div class="button-row">
+          <button id="saveConfig" class="secondary">Save</button>
+          <button id="premarket" class="secondary">Premarket Data Cache</button>
+        </div>
+        <div class="cache-summary">
+          <div id="premarketStats">Cache idle</div>
+          <div id="missingStocks"></div>
+          <div id="missingSectors"></div>
+        </div>
+      </div>
+
+      <div class="panel settings">
+        <h2>Settings</h2>
+        <div class="segmented" role="group" aria-label="Timeframe">
+          <button class="tf active" data-value="5">5m</button>
+          <button class="tf" data-value="1">1m</button>
+        </div>
+        <div class="grid-2">
+          <label>Per trade capital <input id="perTradeCapital" type="number" min="0" step="1" value="10000"></label>
+          <label>Per trade risk <input id="perTradeRisk" type="number" min="0" step="1" value="20"></label>
+          <label>Volume SMA <input id="smaPeriod" type="number" min="1" value="20"></label>
+          <label>Near high % <input id="nearHigh" type="number" min="1" max="100" value="70"></label>
+          <label>Volume x <input id="volumeMultiplier" type="number" min="0" step="0.1" value="8"></label>
+          <label>Fixed SL % <input id="fixedSl" type="number" min="0" step="0.1" value="0.7"></label>
+          <label>Risk reward <input id="riskReward" type="number" min="0.1" step="0.1" value="3"></label>
+        </div>
+        <div class="toggles">
+          <label><input id="dryRun" type="checkbox" checked> Dry run</label>
+          <label><input id="capitalSizing" name="sizingMode" type="radio" checked> Capital sizing</label>
+          <label><input id="riskSizing" name="sizingMode" type="radio"> Risk sizing</label>
+          <label><input id="sectorFilter" type="checkbox"> Sector filter</label>
+          <label>Top sectors <input id="topSectorCount" type="number" min="1" value="2"></label>
+        </div>
+      </div>
+
+      <div class="panel strategies">
+        <h2>Strategies</h2>
+        <div class="strategy-list">
+          <label><input class="strategy" data-key="long_s1" type="checkbox" checked> Long Strategy 1</label>
+          <label><input class="strategy" data-key="long_s2" type="checkbox" checked> Long Strategy 2</label>
+          <label><input class="strategy" data-key="long_s3" type="checkbox" checked> Long Strategy 3</label>
+          <label><input class="strategy" data-key="long_s4" type="checkbox" checked> Long Strategy 4</label>
+          <label class="disabled"><input class="strategy" data-key="short_s1" type="checkbox"> Short Strategy 1</label>
+          <label class="disabled"><input class="strategy" data-key="short_s2" type="checkbox"> Short Strategy 2</label>
+          <label class="disabled"><input class="strategy" data-key="short_s3" type="checkbox"> Short Strategy 3</label>
+          <label class="disabled"><input class="strategy" data-key="short_s4" type="checkbox"> Short Strategy 4</label>
+        </div>
+        <div class="button-row primary-row">
+          <button id="startAlgo" class="primary">Start Algo</button>
+          <button id="stopAlgo" class="danger">Stop Algo</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="watchlists">
+      <div class="panel">
+        <h2>Nifty 500 Universe</h2>
+        <textarea id="universeText" spellcheck="false" placeholder="Paste your Nifty 500 stock list here"></textarea>
+        <div class="hint"><span id="universeCount">0</span> symbols</div>
+      </div>
+      <div class="panel">
+        <h2>Long Watchlist</h2>
+        <textarea id="longText" spellcheck="false" placeholder="Paste Chartink, NSE table, CSV, or symbols"></textarea>
+        <div class="hint"><span id="longCount">0</span> symbols</div>
+      </div>
+      <div class="panel">
+        <h2>Short Watchlist</h2>
+        <textarea id="shortText" spellcheck="false" placeholder="Short rules will be implemented later"></textarea>
+        <div class="hint"><span id="shortCount">0</span> symbols</div>
+      </div>
+    </section>
+
+    <section class="cache-report-section">
+      <div class="panel cache-report-panel">
+        <div class="panel-head">
+          <h2>Premarket Cache Report</h2>
+          <button id="refreshReport" class="secondary">Refresh Report</button>
+        </div>
+        <div id="cacheReportStatus" class="cache-report-status">Report not loaded</div>
+        <div class="cache-metrics">
+          <div><span id="cacheStockCount">0/0</span><small>Stocks cached</small></div>
+          <div><span id="cacheSectorCount">0/0</span><small>Sectors cached</small></div>
+          <div><span id="cacheStockMissingCount">0</span><small>Missing stocks</small></div>
+          <div><span id="cacheSectorMissingCount">0</span><small>Missing sectors</small></div>
+        </div>
+        <div class="missing-grid">
+          <div>
+            <h3>Missing Stocks</h3>
+            <div id="cacheStockMissingList" class="missing-list">-</div>
+          </div>
+          <div>
+            <h3>Missing Sectors</h3>
+            <div id="cacheSectorMissingList" class="missing-list">-</div>
+          </div>
+        </div>
+        <div id="cacheReportFile" class="hint"></div>
+      </div>
+    </section>
+
+    <section class="live-grid">
+      <div class="panel">
+        <h2>Trade Details</h2>
+        <div class="table-wrap">
+          <table>
+            <thead><tr><th>Symbol</th><th>Side</th><th>Strategy</th><th>Qty</th><th>Entry</th><th>SL</th><th>Target</th><th>Status</th></tr></thead>
+            <tbody id="positions"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>Resolved Instruments</h2>
+        <div class="table-wrap compact-table">
+          <table>
+            <thead><tr><th>Symbol</th><th>Security ID</th><th>Sector</th><th>LTP</th><th>1m</th><th>5m</th></tr></thead>
+            <tbody id="instruments"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="panel">
+        <h2>Sector Rankings</h2>
+        <div class="table-wrap compact-table">
+          <table>
+            <thead><tr><th>Sector</th><th>Security ID</th><th>LTP</th><th>Prev Close</th><th>%</th></tr></thead>
+            <tbody id="sectors"></tbody>
+          </table>
+        </div>
+      </div>
+      <div class="panel events-panel">
+        <h2>Events</h2>
+        <div id="events" class="events"></div>
+      </div>
+    </section>
+  </main>
+  <script src="/static/app.js?v=20260803-cache-report"></script>
+</body>
+</html>
