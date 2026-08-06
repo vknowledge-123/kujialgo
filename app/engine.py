@@ -9,7 +9,7 @@ from uuid import uuid4
 
 import websockets
 
-from .candles import CandleStore, IST, expected_starts_for_day, to_ist
+from .candles import CandleStore, IST, SESSION_OPEN, expected_starts_for_day, to_ist
 from .config import (
     DHAN_FEED_URL,
     DHAN_ORDER_UPDATE_URL,
@@ -19,6 +19,7 @@ from .config import (
     PREMARKET_FILE,
     PREMARKET_REPORT_FILE,
     STATE_FILE,
+    TRADE_LEDGER_FILE,
 )
 from .dhan_api import DhanAuthenticationError, DhanClient
 from .models import Candle, Instrument, Position
@@ -36,6 +37,69 @@ EXCHANGE_SEGMENT_CODES = {0: "IDX_I", 1: "NSE_EQ", 4: "BSE_EQ"}
 TRADED_STATUSES = {"TRADED", "COMPLETED"}
 FAILED_STATUSES = {"REJECTED", "CANCELLED", "EXPIRED", "FAILED"}
 PENDING_STATUSES = {"TRANSIT", "PENDING"}
+FINAL_ORDER_STATUSES = TRADED_STATUSES | FAILED_STATUSES
+PENDING_LEDGER_STATUSES = {"PENDING_ENTRY", "PENDING_EXIT", "PENDING_PYRAMID", "PENDING_ORDER", "TRANSIT", "PENDING"}
+
+
+def _today_key() -> str:
+    return datetime.now(IST).date().isoformat()
+
+
+def _empty_ledger() -> dict[str, Any]:
+    return {
+        "session_date": _today_key(),
+        "orders": {},
+        "positions": {},
+        "updated_at": datetime.now(IST).isoformat(),
+    }
+
+
+def _as_list_payload(data: Any) -> list[dict[str, Any]]:
+    payload = data.get("data", data) if isinstance(data, dict) else data
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        payload = payload["data"]
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    return []
+
+
+def _broker_order_id(row: dict[str, Any]) -> str:
+    row = row.get("data", row) if isinstance(row.get("data"), dict) else row
+    return str(row.get("orderId") or row.get("OrderNo") or row.get("OrderId") or row.get("order_id") or "")
+
+
+def _broker_correlation_id(row: dict[str, Any]) -> str:
+    row = row.get("data", row) if isinstance(row.get("data"), dict) else row
+    return str(row.get("correlationId") or row.get("CorrelationId") or row.get("correlation_id") or "")
+
+
+def _broker_order_status(row: dict[str, Any], fallback: str = "") -> str:
+    row = row.get("data", row) if isinstance(row.get("data"), dict) else row
+    return str(row.get("orderStatus") or row.get("Status") or row.get("OrderStatus") or fallback or "").upper()
+
+
+def _broker_quantity(row: dict[str, Any], *keys: str) -> int:
+    row = row.get("data", row) if isinstance(row.get("data"), dict) else row
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            try:
+                return int(float(value))
+            except (TypeError, ValueError):
+                continue
+    return 0
+
+
+def _broker_price(row: dict[str, Any], *keys: str) -> float:
+    row = row.get("data", row) if isinstance(row.get("data"), dict) else row
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            try:
+                return float(value)
+            except (TypeError, ValueError):
+                continue
+    return 0.0
 
 
 def _json_objects_from_message(message: str | bytes) -> list[Any]:
@@ -196,10 +260,12 @@ class DhanAlgoEngine:
         self.loop: asyncio.AbstractEventLoop | None = None
         self.tick_queue: asyncio.Queue[tuple[str, str, float, int | None, datetime]] | None = None
         self.feed_threads: list[threading.Thread] = []
+        self.feed_sockets: list[Any] = []
         self.order_task: asyncio.Task | None = None
         self.tick_task: asyncio.Task | None = None
         self.cache_task: asyncio.Task | None = None
         self.reconcile_task: asyncio.Task | None = None
+        self.broker_reconcile_task: asyncio.Task | None = None
         self.credentials: dict[str, str] = {}
         self.long_symbols: list[str] = []
         self.short_symbols: list[str] = []
@@ -211,11 +277,26 @@ class DhanAlgoEngine:
         self.sector_live: dict[str, dict[str, Any]] = {}
         self.order_updates: dict[str, dict[str, Any]] = {}
         self.positions: dict[str, Position] = {}
+        self.scalper_state: dict[str, dict[str, Any]] = {}
+        self.ledger: dict[str, Any] = _empty_ledger()
+        self.locked_symbols: set[str] = set()
+        self.broker_positions: dict[str, dict[str, Any]] = {}
+        self.broker_reconcile_status: dict[str, Any] = {
+            "running": False,
+            "message": "Not checked",
+            "last_run": "",
+            "mismatches": [],
+            "pending_orders": [],
+            "failed_orders": [],
+            "locked_symbols": [],
+        }
         self.events: list[dict[str, Any]] = []
         self.premarket_status: dict[str, Any] = {"running": False, "message": "Not started", "progress": 0}
         self.reconcile_status: dict[str, Any] = {"running": False, "message": "Not started", "last_run": "", "last_missing": {}}
         self.lock = threading.RLock()
         self._load_state()
+        self._load_ledger()
+        self._load_positions_from_ledger()
 
     def _load_state(self) -> None:
         state = read_json(STATE_FILE, {})
@@ -237,6 +318,147 @@ class DhanAlgoEngine:
             },
         )
 
+    def _load_ledger(self) -> None:
+        ledger = read_json(TRADE_LEDGER_FILE, _empty_ledger())
+        if not isinstance(ledger, dict) or ledger.get("session_date") != _today_key():
+            ledger = _empty_ledger()
+        ledger.setdefault("orders", {})
+        ledger.setdefault("positions", {})
+        self.ledger = ledger
+
+    def _save_ledger(self) -> None:
+        self.ledger["updated_at"] = datetime.now(IST).isoformat()
+        write_json(TRADE_LEDGER_FILE, self.ledger)
+
+    def _load_positions_from_ledger(self) -> None:
+        loaded: dict[str, Position] = {}
+        for key, row in (self.ledger.get("positions") or {}).items():
+            if not isinstance(row, dict) or row.get("status") != "OPEN":
+                continue
+            try:
+                loaded[key] = Position(
+                    symbol=str(row.get("symbol") or ""),
+                    security_id=str(row.get("security_id") or ""),
+                    side=str(row.get("side") or "LONG").upper(),
+                    strategy=str(row.get("strategy") or "recovered"),
+                    entry_price=float(row.get("entry_price") or 0),
+                    quantity=int(row.get("quantity") or 0),
+                    stop_loss=float(row.get("stop_loss") or 0),
+                    target=float(row.get("target") or 0),
+                    opened_at=str(row.get("opened_at") or datetime.now(IST).isoformat()),
+                    status=str(row.get("status") or "OPEN"),
+                    order_id=str(row.get("order_id") or ""),
+                    exit_order_id=str(row.get("exit_order_id") or ""),
+                    exit_reason=str(row.get("exit_reason") or ""),
+                    last_price=float(row.get("last_price") or 0),
+                    meta=dict(row.get("meta") or {}),
+                )
+            except (TypeError, ValueError):
+                continue
+        self.positions.update(loaded)
+
+    def _position_key(self, symbol: str, side: str) -> str:
+        return f"{symbol}:{side.upper()}"
+
+    def _persist_position(self, position: Position) -> None:
+        key = self._position_key(position.symbol, position.side)
+        self.ledger.setdefault("positions", {})[key] = position.as_dict()
+        self._save_ledger()
+
+    def _ledger_order_status_for_role(self, order_role: str) -> str:
+        role = str(order_role or "").upper()
+        if role == "PYRAMID":
+            return "PENDING_PYRAMID"
+        if role == "EXIT":
+            return "PENDING_EXIT"
+        if role == "ENTRY":
+            return "PENDING_ENTRY"
+        return "PENDING_ORDER"
+
+    def _record_order_intent(
+        self,
+        instrument: Instrument,
+        transaction_type: str,
+        quantity: int,
+        correlation_id: str,
+        order_role: str,
+        position_key: str,
+        metadata: dict[str, Any] | None = None,
+        attempt: int = 1,
+    ) -> None:
+        record = {
+            "correlation_id": correlation_id,
+            "order_id": "",
+            "symbol": instrument.symbol,
+            "security_id": str(instrument.security_id),
+            "transaction_type": transaction_type.upper(),
+            "quantity": int(quantity),
+            "order_role": order_role.upper(),
+            "position_key": position_key,
+            "status": self._ledger_order_status_for_role(order_role),
+            "average_price": 0.0,
+            "traded_quantity": 0,
+            "attempt": attempt,
+            "metadata": {"reference_price": float((metadata or {}).get("reference_price") or 0), **(metadata or {})},
+            "applied_to_position": False,
+            "created_at": datetime.now(IST).isoformat(),
+            "updated_at": datetime.now(IST).isoformat(),
+        }
+        self.ledger.setdefault("orders", {})[correlation_id] = record
+        self._save_ledger()
+
+    def _update_ledger_order(self, correlation_id: str, updates: dict[str, Any]) -> None:
+        if not correlation_id:
+            return
+        record = (self.ledger.setdefault("orders", {})).setdefault(correlation_id, {"correlation_id": correlation_id})
+        record.update({key: value for key, value in updates.items() if value is not None})
+        record["updated_at"] = datetime.now(IST).isoformat()
+        self._save_ledger()
+
+    def _mark_latest_order_applied(self, correlation_id: str) -> None:
+        if correlation_id:
+            self._update_ledger_order(correlation_id, {"applied_to_position": True})
+
+    def _update_ledger_order_from_broker(self, row: dict[str, Any], fallback_correlation_id: str = "") -> str:
+        correlation_id = _broker_correlation_id(row) or fallback_correlation_id
+        if not correlation_id:
+            order_id = _broker_order_id(row)
+            for key, record in (self.ledger.get("orders") or {}).items():
+                if order_id and str(record.get("order_id") or "") == order_id:
+                    correlation_id = key
+                    break
+        if not correlation_id:
+            return ""
+        status = _broker_order_status(row)
+        average_price = self._average_price_from_order(row)
+        traded_quantity = _broker_quantity(row, "filledQty", "tradedQuantity", "tradedQty", "quantity")
+        self._update_ledger_order(
+            correlation_id,
+            {
+                "order_id": _broker_order_id(row) or None,
+                "status": status or None,
+                "average_price": average_price or None,
+                "traded_quantity": traded_quantity or None,
+                "raw": row,
+            },
+        )
+        return correlation_id
+
+    def _average_price_from_order(self, row: dict[str, Any]) -> float:
+        return _broker_price(
+            row,
+            "averageTradedPrice",
+            "averagePrice",
+            "avgPrice",
+            "tradedPrice",
+            "price",
+            "buyAvg",
+            "sellAvg",
+        )
+
+    def _is_symbol_locked(self, symbol: str) -> bool:
+        return symbol in self.locked_symbols
+
     def _handle_auth_failure(self, source: str, exc: Exception) -> None:
         self.last_error = f"{source}: Dhan credentials invalid or expired. Update client ID/access token and restart algo."
         self.event("ERROR", self.last_error)
@@ -256,12 +478,13 @@ class DhanAlgoEngine:
             current = asyncio.current_task()
         except RuntimeError:
             current = None
-        for task in (self.tick_task, self.order_task, self.reconcile_task):
+        for task in (self.tick_task, self.order_task, self.reconcile_task, self.broker_reconcile_task):
             if task and task is not current and not task.done():
                 task.cancel()
 
     def configure(self, payload: dict[str, Any]) -> dict[str, Any]:
         with self.lock:
+            old_security_ids = set(self.instruments_by_security)
             if payload.get("credentials"):
                 creds = payload["credentials"]
                 client_id = str(creds.get("client_id") or "").strip()
@@ -289,6 +512,8 @@ class DhanAlgoEngine:
             if "short_text" in payload:
                 self.short_symbols = extract_symbols(payload.get("short_text") or "", self.universe_symbols)
             self._resolve_watchlists()
+            if self.running and set(self.instruments_by_security) != old_security_ids:
+                self._restart_market_feed_threads()
             self.save_state()
         return self.snapshot()
 
@@ -324,11 +549,14 @@ class DhanAlgoEngine:
         subscription_count = len(self.instruments_by_symbol) + len(self.sector_instruments)
         if subscription_count > max_subscriptions:
             raise RuntimeError(f"Dhan supports {max_subscriptions} instruments across {MAX_MARKET_FEED_CONNECTIONS} feed connections.")
+        await self.reconcile_broker_state(startup=True)
         self.running = True
+        self.scalper_state = {}
         self.feed_generation += 1
         self.tick_task = asyncio.create_task(self._tick_worker())
         self.order_task = asyncio.create_task(self._order_update_worker())
         self.reconcile_task = asyncio.create_task(self._auto_reconcile_worker())
+        self.broker_reconcile_task = asyncio.create_task(self._broker_reconcile_worker())
         self._start_market_feed_threads(self.feed_generation)
         self.event("INFO", f"Algo started with {len(self.instruments_by_symbol)} stocks and {len(self.sector_instruments)} sector indexes on {self.settings.timeframe}m.")
         return self.snapshot()
@@ -338,11 +566,34 @@ class DhanAlgoEngine:
         self.feed_generation += 1
         self.market_connected = False
         self.order_connected = False
-        for task in (self.tick_task, self.order_task, self.reconcile_task):
+        self._close_market_feed_sockets()
+        for task in (self.tick_task, self.order_task, self.reconcile_task, self.broker_reconcile_task):
             if task:
                 task.cancel()
         self.event("INFO", "Algo stopped.")
         return self.snapshot()
+
+    def _restart_market_feed_threads(self) -> None:
+        max_subscriptions = MAX_MARKET_FEED_CONNECTIONS * MAX_INSTRUMENTS_PER_CONNECTION
+        subscription_count = len(self.instruments_by_symbol) + len(self.sector_instruments)
+        if subscription_count > max_subscriptions:
+            self.event("ERROR", f"Market feed not restarted: Dhan supports {max_subscriptions} instruments across {MAX_MARKET_FEED_CONNECTIONS} feed connections.")
+            return
+        self.feed_generation += 1
+        self.market_connected = False
+        self._close_market_feed_sockets()
+        self._start_market_feed_threads(self.feed_generation)
+        self.event("INFO", f"Market feed resubscribed with {len(self.instruments_by_symbol)} stocks and {len(self.sector_instruments)} sector indexes.")
+
+    def _close_market_feed_sockets(self) -> None:
+        with self.lock:
+            sockets = list(self.feed_sockets)
+            self.feed_sockets = []
+        for ws in sockets:
+            try:
+                ws.close()
+            except Exception:
+                pass
 
     def _start_market_feed_threads(self, generation: int) -> None:
         try:
@@ -396,11 +647,17 @@ class DhanAlgoEngine:
         backoff = 2
         while generation == self.feed_generation and self.running:
             ws = websocket_module.WebSocketApp(url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
+            with self.lock:
+                self.feed_sockets.append(ws)
             try:
                 ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as exc:
                 self.market_connected = False
                 self.last_error = f"Dhan market WebSocket stopped: {exc}"
+            finally:
+                with self.lock:
+                    if ws in self.feed_sockets:
+                        self.feed_sockets.remove(ws)
             if generation != self.feed_generation or not self.running:
                 break
             time.sleep(backoff)
@@ -442,12 +699,20 @@ class DhanAlgoEngine:
             if not instrument:
                 continue
             closed = self.candles.on_tick(instrument, price, volume, timestamp)
-            await self._evaluate_tick(instrument, price)
+            await self._evaluate_tick(instrument, price, timestamp)
             for candle in closed:
                 await self._evaluate_closed_candle(instrument, candle)
 
-    async def _evaluate_tick(self, instrument: Instrument, price: float) -> None:
+    async def _evaluate_tick(self, instrument: Instrument, price: float, timestamp: datetime | None = None) -> None:
         symbol = instrument.symbol
+        timestamp = to_ist(timestamp)
+        for position in self._open_positions_for_symbol(symbol):
+            position.last_price = price
+            if position.strategy in {"scalper_long", "scalper_short"}:
+                await self._manage_scalper_position(position, instrument, price)
+        await self._evaluate_scalper_tick(instrument, price, timestamp)
+        if self._is_symbol_locked(symbol):
+            return
         if symbol not in self.long_symbols or self._has_open_position(symbol):
             return
         if not self._passes_sector_filter(symbol, "long"):
@@ -464,10 +729,14 @@ class DhanAlgoEngine:
         candles = self.candles.closed_candles(symbol, self.settings.timeframe)
         for position in list(self.positions.values()):
             if position.symbol == symbol and position.status == "OPEN":
+                if position.strategy in {"scalper_long", "scalper_short"}:
+                    continue
                 reason = self.long_evaluator.evaluate_exit(position, candles, self.settings)
                 if reason:
                     await self._exit_position(position, reason)
         if symbol not in self.long_symbols or self._has_open_position(symbol):
+            return
+        if self._is_symbol_locked(symbol):
             return
         previous_day = self._previous_day(symbol)
         baseline = self._baseline(symbol, self.settings.timeframe)
@@ -477,17 +746,45 @@ class DhanAlgoEngine:
                 await self._enter_position(instrument, event)
 
     async def _enter_position(self, instrument: Instrument, signal: dict[str, Any]) -> None:
+        if self._is_symbol_locked(instrument.symbol):
+            self.event("WARN", f"{instrument.symbol} entry blocked: broker/app quantity mismatch is locked.")
+            return
         entry = float(signal["entry_price"])
         stop, target = setup_stop(entry, signal["stop_candle"], self.settings)
-        quantity, sizing_reason = calculate_quantity(entry, stop, self.settings)
+        quantity, sizing_reason = calculate_quantity(entry, stop, self.settings, "LONG")
         if quantity < 1:
             self.event("WARN", f"{instrument.symbol} entry skipped: calculated quantity is 0 ({sizing_reason}).")
             return
         correlation_id = f"KJ{uuid4().hex[:18]}"
-        order = await self._place_with_retry(instrument, "BUY", quantity, correlation_id)
+        position_key = self._position_key(instrument.symbol, "LONG")
+        order = await self._place_with_retry(
+            instrument,
+            "BUY",
+            quantity,
+            correlation_id,
+            order_role="ENTRY",
+            position_key=position_key,
+            reference_price=entry,
+            metadata={
+                "position": {
+                    "side": "LONG",
+                    "strategy": signal["strategy"],
+                    "entry_price": entry,
+                    "stop_loss": stop,
+                    "target": target,
+                    "quantity": quantity,
+                    "reason": signal.get("reason"),
+                    "sizing": sizing_reason,
+                }
+            },
+        )
         status = order.get("status", "")
         if str(status).upper() not in TRADED_STATUSES:
             self.event("ERROR", f"{instrument.symbol} entry not opened because order status is {status or 'UNKNOWN'}.")
+            return
+        executed_quantity = int(order.get("traded_quantity") or quantity)
+        if executed_quantity < 1:
+            self.event("ERROR", f"{instrument.symbol} entry not opened because broker traded quantity is 0.")
             return
         position = Position(
             symbol=instrument.symbol,
@@ -495,53 +792,476 @@ class DhanAlgoEngine:
             side="LONG",
             strategy=signal["strategy"],
             entry_price=entry,
-            quantity=quantity,
+            quantity=executed_quantity,
             stop_loss=stop,
             target=target,
             opened_at=datetime.now(IST).isoformat(),
             order_id=str(order.get("order_id") or ""),
             last_price=entry,
-            meta={"entry_order_status": status, "reason": signal.get("reason"), "sizing": sizing_reason},
+            meta={"entry_order_status": status, "reason": signal.get("reason"), "sizing": sizing_reason, "requested_quantity": quantity},
         )
-        self.positions[f"{instrument.symbol}:LONG"] = position
-        self.event("ENTRY", f"{instrument.symbol} {signal['strategy']} BUY {quantity} at {entry:.2f}, SL {stop:.2f}, target {target:.2f} ({sizing_reason})")
+        self.positions[position_key] = position
+        self._mark_latest_order_applied(str(order.get("correlation_id") or ""))
+        self._persist_position(position)
+        self.event("ENTRY", f"{instrument.symbol} {signal['strategy']} BUY {executed_quantity} at {entry:.2f}, SL {stop:.2f}, target {target:.2f} ({sizing_reason})")
+
+    async def _evaluate_scalper_tick(self, instrument: Instrument, price: float, timestamp: datetime) -> None:
+        if price <= 0 or self._has_open_position(instrument.symbol):
+            return
+        if self._is_symbol_locked(instrument.symbol):
+            return
+        want_long = self.settings.enabled.get("scalper_long") and instrument.symbol in self.long_symbols
+        want_short = self.settings.enabled.get("scalper_short") and instrument.symbol in self.short_symbols
+        if not want_long and not want_short:
+            return
+        state = self._scalper_reference_state(instrument.symbol, price, timestamp)
+        if not state.get("ready"):
+            return
+        if want_long and not state.get("long_triggered"):
+            if self._passes_sector_filter(instrument.symbol, "long") and price > float(state.get("high") or 0):
+                if await self._enter_scalper_position(instrument, "LONG", price, "Break above scalper reference high"):
+                    state["long_triggered"] = True
+                return
+        if want_short and not state.get("short_triggered"):
+            if self._passes_sector_filter(instrument.symbol, "short") and price < float(state.get("low") or 0):
+                if await self._enter_scalper_position(instrument, "SHORT", price, "Break below scalper reference low"):
+                    state["short_triggered"] = True
+
+    def _scalper_reference_state(self, symbol: str, price: float, timestamp: datetime) -> dict[str, Any]:
+        timestamp = to_ist(timestamp)
+        session_open_dt = timestamp.replace(
+            hour=SESSION_OPEN.hour,
+            minute=SESSION_OPEN.minute,
+            second=0,
+            microsecond=0,
+        )
+        range_end = session_open_dt + timedelta(seconds=5)
+        state = self.scalper_state.get(symbol)
+        if state and state.get("session_date") != timestamp.date().isoformat():
+            state = None
+        if not state:
+            state = {
+                "session_date": timestamp.date().isoformat(),
+                "high": 0.0,
+                "low": 0.0,
+                "ready": False,
+                "long_triggered": False,
+                "short_triggered": False,
+                "mode": "opening_range",
+            }
+            self.scalper_state[symbol] = state
+        if timestamp <= range_end:
+            state["high"] = max(float(state.get("high") or 0), price)
+            current_low = float(state.get("low") or 0)
+            state["low"] = min(current_low, price) if current_low > 0 else price
+            state["ready"] = False
+            return state
+        if not state.get("ready"):
+            high = float(state.get("high") or 0)
+            low = float(state.get("low") or 0)
+            if high <= 0 or low <= 0:
+                high, low = self._day_extremes_until(symbol, price, timestamp)
+                state["mode"] = "late_day_reference"
+            state["high"] = high
+            state["low"] = low
+            state["ready"] = True
+            state["ready_at"] = timestamp.isoformat()
+            return state
+        return state
+
+    def _day_extremes_until(self, symbol: str, price: float, timestamp: datetime) -> tuple[float, float]:
+        session_open_dt = timestamp.replace(
+            hour=SESSION_OPEN.hour,
+            minute=SESSION_OPEN.minute,
+            second=0,
+            microsecond=0,
+        )
+        highs = [float(price)]
+        lows = [float(price)]
+        for candle in self.candles.all_candles(symbol, 1):
+            start = to_ist(candle.start)
+            if start.date() == timestamp.date() and session_open_dt <= start <= timestamp:
+                highs.append(float(candle.high))
+                lows.append(float(candle.low))
+        return max(highs), min(lows)
+
+    async def _enter_scalper_position(self, instrument: Instrument, side: str, entry: float, reason: str) -> bool:
+        if self._is_symbol_locked(instrument.symbol):
+            self.event("WARN", f"{instrument.symbol} scalper {side.lower()} blocked: broker/app quantity mismatch is locked.")
+            return False
+        stop, target = self._scalper_stop_target(entry, side)
+        quantity, sizing_reason = calculate_quantity(entry, stop, self.settings, side)
+        if quantity < 1:
+            self.event("WARN", f"{instrument.symbol} scalper {side.lower()} skipped: calculated quantity is 0 ({sizing_reason}).")
+            return False
+        transaction_type = "BUY" if side == "LONG" else "SELL"
+        correlation_id = f"KJS{uuid4().hex[:17]}"
+        position_key = self._position_key(instrument.symbol, side)
+        strategy = "scalper_long" if side == "LONG" else "scalper_short"
+        order = await self._place_with_retry(
+            instrument,
+            transaction_type,
+            quantity,
+            correlation_id,
+            order_role="ENTRY",
+            position_key=position_key,
+            reference_price=entry,
+            metadata={
+                "position": {
+                    "side": side,
+                    "strategy": strategy,
+                    "entry_price": entry,
+                    "stop_loss": stop,
+                    "target": target,
+                    "quantity": quantity,
+                    "reason": reason,
+                    "sizing": sizing_reason,
+                }
+            },
+        )
+        status = str(order.get("status") or "").upper()
+        if status not in TRADED_STATUSES:
+            self.event("ERROR", f"{instrument.symbol} scalper {side.lower()} not opened because order status is {status or 'UNKNOWN'}.")
+            return False
+        executed_quantity = int(order.get("traded_quantity") or quantity)
+        if executed_quantity < 1:
+            self.event("ERROR", f"{instrument.symbol} scalper {side.lower()} not opened because broker traded quantity is 0.")
+            return False
+        initial_risk = abs(entry - stop)
+        position = Position(
+            symbol=instrument.symbol,
+            security_id=instrument.security_id,
+            side=side,
+            strategy=strategy,
+            entry_price=round(entry, 2),
+            quantity=executed_quantity,
+            stop_loss=stop,
+            target=target,
+            opened_at=datetime.now(IST).isoformat(),
+            order_id=str(order.get("order_id") or ""),
+            last_price=entry,
+            meta={
+                "entry_order_status": status,
+                "reason": reason,
+                "sizing": sizing_reason,
+                "initial_entry": entry,
+                "initial_risk": initial_risk,
+                "initial_quantity": executed_quantity,
+                "requested_quantity": quantity,
+                "pyramid_adds": 0,
+                "pyramid_orders": [],
+                "breakeven_moved": False,
+                "sl_percent": self.settings.scalper_sl_percent,
+            },
+        )
+        self.positions[position_key] = position
+        self._mark_latest_order_applied(str(order.get("correlation_id") or ""))
+        self._persist_position(position)
+        self.event("ENTRY", f"{instrument.symbol} {strategy} {transaction_type} {executed_quantity} at {entry:.2f}, SL {stop:.2f}, target {target:.2f} ({sizing_reason})")
+        return True
+
+    def _scalper_stop_target(self, entry: float, side: str) -> tuple[float, float]:
+        sl_percent = max(0.1, float(self.settings.scalper_sl_percent or 0.8))
+        risk = entry * sl_percent / 100
+        if side == "SHORT":
+            stop = entry + risk
+            target = entry - risk * self.settings.risk_reward
+        else:
+            stop = entry - risk
+            target = entry + risk * self.settings.risk_reward
+        return round(stop, 2), round(target, 2)
+
+    async def _manage_scalper_position(self, position: Position, instrument: Instrument, price: float) -> None:
+        if position.status != "OPEN":
+            return
+        reason = self._scalper_exit_reason(position, price)
+        if reason:
+            await self._exit_position(position, reason)
+            return
+        self._trail_scalper_to_breakeven(position, price)
+        await self._maybe_pyramid_scalper(position, instrument, price)
+
+    def _scalper_exit_reason(self, position: Position, price: float) -> str:
+        if position.side == "SHORT":
+            if price >= position.stop_loss:
+                return "STOP_LOSS"
+            if price <= position.target:
+                return "TARGET"
+            return ""
+        if price <= position.stop_loss:
+            return "STOP_LOSS"
+        if price >= position.target:
+            return "TARGET"
+        return ""
+
+    def _trail_scalper_to_breakeven(self, position: Position, price: float) -> None:
+        if position.meta.get("breakeven_moved"):
+            return
+        initial_entry = float(position.meta.get("initial_entry") or position.entry_price)
+        initial_risk = float(position.meta.get("initial_risk") or abs(position.entry_price - position.stop_loss))
+        if initial_risk <= 0:
+            return
+        if position.side == "SHORT":
+            trigger = initial_entry - initial_risk * 2
+            if price <= trigger:
+                position.stop_loss = min(position.stop_loss, round(position.entry_price, 2))
+                position.meta["breakeven_moved"] = True
+                self._persist_position(position)
+                self.event("INFO", f"{position.symbol} scalper short SL trailed to cost {position.stop_loss:.2f}.")
+            return
+        trigger = initial_entry + initial_risk * 2
+        if price >= trigger:
+            position.stop_loss = max(position.stop_loss, round(position.entry_price, 2))
+            position.meta["breakeven_moved"] = True
+            self._persist_position(position)
+            self.event("INFO", f"{position.symbol} scalper long SL trailed to cost {position.stop_loss:.2f}.")
+
+    async def _maybe_pyramid_scalper(self, position: Position, instrument: Instrument, price: float) -> None:
+        if not self.settings.scalper_pyramiding:
+            return
+        max_adds = max(0, int(self.settings.scalper_max_adds or 0))
+        add_count = int(position.meta.get("pyramid_adds") or 0)
+        initial_quantity = int(position.meta.get("initial_quantity") or position.quantity)
+        initial_entry = float(position.meta.get("initial_entry") or position.entry_price)
+        sl_percent = max(0.1, float(position.meta.get("sl_percent") or self.settings.scalper_sl_percent or 0.8))
+        if max_adds <= 0 or initial_quantity <= 0 or initial_entry <= 0:
+            return
+        while add_count < max_adds:
+            next_add = add_count + 1
+            if position.side == "SHORT":
+                threshold = initial_entry * (1 - (sl_percent / 100) * next_add)
+                should_add = price <= threshold
+                transaction_type = "SELL"
+            else:
+                threshold = initial_entry * (1 + (sl_percent / 100) * next_add)
+                should_add = price >= threshold
+                transaction_type = "BUY"
+            if not should_add:
+                return
+            order = await self._place_with_retry(
+                instrument,
+                transaction_type,
+                initial_quantity,
+                f"KJP{uuid4().hex[:17]}",
+                order_role="PYRAMID",
+                position_key=self._position_key(position.symbol, position.side),
+                reference_price=price,
+                metadata={"pyramid_add": next_add, "initial_quantity": initial_quantity},
+            )
+            status = str(order.get("status") or "").upper()
+            if status not in TRADED_STATUSES:
+                self.event("ERROR", f"{position.symbol} scalper pyramid add {next_add} failed with status {status or 'UNKNOWN'}; algo quantity unchanged.")
+                return
+            executed_quantity = int(order.get("traded_quantity") or initial_quantity)
+            if executed_quantity < 1:
+                self.event("ERROR", f"{position.symbol} scalper pyramid add {next_add} returned traded quantity 0; algo quantity unchanged.")
+                return
+            old_quantity = position.quantity
+            new_quantity = old_quantity + executed_quantity
+            fill_price = float(order.get("average_price") or price)
+            position.entry_price = round(((position.entry_price * old_quantity) + (fill_price * executed_quantity)) / new_quantity, 2)
+            position.quantity = new_quantity
+            add_count = next_add
+            position.meta["pyramid_adds"] = add_count
+            position.meta.setdefault("pyramid_orders", []).append(
+                {"order_id": str(order.get("order_id") or ""), "quantity": executed_quantity, "requested_quantity": initial_quantity, "price": fill_price, "status": status}
+            )
+            self._refresh_scalper_risk(position)
+            self._mark_latest_order_applied(str(order.get("correlation_id") or ""))
+            self._persist_position(position)
+            self.event("ENTRY", f"{position.symbol} scalper pyramid {transaction_type} add {add_count}/{max_adds}: +{executed_quantity}, total {position.quantity}, avg {position.entry_price:.2f}.")
+
+    def _refresh_scalper_risk(self, position: Position) -> None:
+        sl_percent = max(0.1, float(position.meta.get("sl_percent") or self.settings.scalper_sl_percent or 0.8))
+        risk = position.entry_price * sl_percent / 100
+        if position.side == "SHORT":
+            stop = position.entry_price + risk
+            target = position.entry_price - risk * self.settings.risk_reward
+            position.stop_loss = round(position.entry_price if position.meta.get("breakeven_moved") else stop, 2)
+            position.target = round(target, 2)
+            return
+        stop = position.entry_price - risk
+        target = position.entry_price + risk * self.settings.risk_reward
+        position.stop_loss = round(position.entry_price if position.meta.get("breakeven_moved") else stop, 2)
+        position.target = round(target, 2)
 
     async def _exit_position(self, position: Position, reason: str) -> None:
         if position.status != "OPEN":
             return
+        transaction_type = "BUY" if position.side == "SHORT" else "SELL"
         order = await self._place_with_retry(
             Instrument(position.symbol, position.security_id),
-            "SELL",
+            transaction_type,
             position.quantity,
             f"KJX{uuid4().hex[:17]}",
+            order_role="EXIT",
+            position_key=self._position_key(position.symbol, position.side),
+            reference_price=position.last_price,
+            metadata={"reason": reason},
         )
+        status = str(order.get("status") or "").upper()
+        if status not in TRADED_STATUSES:
+            self.event("ERROR", f"{position.symbol} exit {reason} not marked closed because order status is {status or 'UNKNOWN'}.")
+            return
+        executed_quantity = int(order.get("traded_quantity") or position.quantity)
+        if executed_quantity < position.quantity:
+            position.quantity -= max(0, executed_quantity)
+            position.exit_order_id = str(order.get("order_id") or "")
+            position.exit_reason = f"PARTIAL_{reason}"
+            self._mark_latest_order_applied(str(order.get("correlation_id") or ""))
+            self._persist_position(position)
+            self.event("WARN", f"{position.symbol} partial exit {reason}: exited {executed_quantity}, remaining {position.quantity}.")
+            return
         position.status = "CLOSED"
         position.exit_order_id = str(order.get("order_id") or "")
         position.exit_reason = reason
+        self._mark_latest_order_applied(str(order.get("correlation_id") or ""))
+        self._persist_position(position)
         self.event("EXIT", f"{position.symbol} exit {reason} at approx {position.last_price or 0:.2f}")
 
-    async def _place_with_retry(self, instrument: Instrument, transaction_type: str, quantity: int, correlation_id: str) -> dict[str, Any]:
+    async def _place_with_retry(
+        self,
+        instrument: Instrument,
+        transaction_type: str,
+        quantity: int,
+        correlation_id: str,
+        order_role: str = "ORDER",
+        position_key: str = "",
+        reference_price: float = 0.0,
+        metadata: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        intent_metadata = dict(metadata or {})
+        intent_metadata.setdefault("reference_price", float(reference_price or 0))
         if self.settings.dry_run:
-            return {"order_id": f"DRY-{uuid4().hex[:10]}", "status": "TRADED", "attempts": 1}
+            dry_correlation_id = f"{correlation_id}1"[:30]
+            self._record_order_intent(
+                instrument,
+                transaction_type,
+                quantity,
+                dry_correlation_id,
+                order_role,
+                position_key,
+                metadata=intent_metadata,
+                attempt=1,
+            )
+            order_id = f"DRY-{uuid4().hex[:10]}"
+            self._update_ledger_order(
+                dry_correlation_id,
+                {
+                    "order_id": order_id,
+                    "status": "TRADED",
+                    "average_price": float(reference_price or 0),
+                    "traded_quantity": int(quantity),
+                    "raw": {"dry_run": True},
+                },
+            )
+            return {
+                "order_id": order_id,
+                "status": "TRADED",
+                "attempts": 1,
+                "correlation_id": dry_correlation_id,
+                "average_price": float(reference_price or 0),
+                "traded_quantity": int(quantity),
+            }
         assert self.client is not None
         last_result: dict[str, Any] = {}
         for attempt in range(1, 4):
-            result = await self.client.place_market_order(instrument.security_id, transaction_type, quantity, f"{correlation_id}{attempt}")
+            attempt_correlation_id = f"{correlation_id}{attempt}"[:30]
+            self._record_order_intent(
+                instrument,
+                transaction_type,
+                quantity,
+                attempt_correlation_id,
+                order_role,
+                position_key,
+                metadata=intent_metadata,
+                attempt=attempt,
+            )
+            try:
+                result = await self.client.place_market_order(instrument.security_id, transaction_type, quantity, attempt_correlation_id)
+            except Exception as exc:
+                last_result = {
+                    "order_id": "",
+                    "status": "PLACE_FAILED",
+                    "attempts": attempt,
+                    "raw": {"error": str(exc)[:500]},
+                    "correlation_id": attempt_correlation_id,
+                    "average_price": 0.0,
+                    "traded_quantity": 0,
+                }
+                self._update_ledger_order(attempt_correlation_id, {"status": "PLACE_FAILED", "raw": last_result["raw"]})
+                if isinstance(exc, DhanAuthenticationError) or _is_auth_error(exc):
+                    raise
+                await asyncio.sleep(0.25 * attempt)
+                continue
             order_id = str(result.get("orderId") or (result.get("data") or {}).get("orderId") or "")
             status = str(result.get("orderStatus") or (result.get("data") or {}).get("orderStatus") or "").upper()
-            last_result = {"order_id": order_id, "status": status, "attempts": attempt, "raw": result}
+            last_result = {
+                "order_id": order_id,
+                "status": status,
+                "attempts": attempt,
+                "raw": result,
+                "correlation_id": attempt_correlation_id,
+                "average_price": 0.0,
+                "traded_quantity": 0,
+            }
+            self._update_ledger_order(attempt_correlation_id, {"order_id": order_id, "status": status, "raw": result})
             final_status = await self._wait_order_status(order_id, status)
             last_result["status"] = final_status
+            details = await self._order_fill_details(order_id, reference_price if final_status in TRADED_STATUSES else 0)
+            last_result.update(details)
+            self._update_ledger_order(
+                attempt_correlation_id,
+                {
+                    "status": final_status,
+                    "average_price": details.get("average_price") or None,
+                    "traded_quantity": details.get("traded_quantity") or None,
+                },
+            )
             if final_status in TRADED_STATUSES:
                 return last_result
             if order_id and final_status in PENDING_STATUSES:
                 try:
                     await self.client.cancel_order(order_id)
+                    self._update_ledger_order(attempt_correlation_id, {"status": "CANCEL_REQUESTED"})
                 except Exception as exc:
                     self.event("WARN", f"Cancel before retry failed for {instrument.symbol}: {exc}")
             await asyncio.sleep(0.25 * attempt)
         self.event("ERROR", f"{instrument.symbol} {transaction_type} failed after 3 attempts: {last_result.get('status')}")
         return last_result
+
+    async def _order_fill_details(self, order_id: str, fallback_price: float = 0.0) -> dict[str, Any]:
+        if not order_id or order_id.startswith("DRY-"):
+            return {"average_price": float(fallback_price or 0), "traded_quantity": 0}
+        average_price = 0.0
+        traded_quantity = 0
+        try:
+            assert self.client is not None
+            trades = await self.client.trades_by_order(order_id)
+            total_value = 0.0
+            total_qty = 0
+            for trade in trades:
+                qty = _broker_quantity(trade, "tradedQuantity", "tradedQty", "quantity", "qty")
+                price = _broker_price(trade, "tradedPrice", "price", "tradePrice")
+                if qty > 0 and price > 0:
+                    total_qty += qty
+                    total_value += qty * price
+            if total_qty > 0:
+                traded_quantity = total_qty
+                average_price = total_value / total_qty
+        except Exception:
+            pass
+        if average_price <= 0:
+            try:
+                assert self.client is not None
+                row = await self.client.order_by_id(order_id)
+                average_price = self._average_price_from_order(row)
+                traded_quantity = _broker_quantity(row, "filledQty", "tradedQuantity", "tradedQty", "quantity")
+            except Exception:
+                pass
+        if average_price <= 0:
+            average_price = float(fallback_price or 0)
+        return {"average_price": round(average_price, 4), "traded_quantity": traded_quantity}
 
     async def _wait_order_status(self, order_id: str, initial_status: str) -> str:
         if not order_id:
@@ -589,6 +1309,7 @@ class DhanAlgoEngine:
                             order_no = str(data.get("OrderNo") or data.get("orderId") or data.get("OrderId") or "")
                             if order_no:
                                 self.order_updates[order_no] = data
+                                self._update_ledger_order_from_broker(data)
             except asyncio.CancelledError:
                 break
             except DhanAuthenticationError as exc:
@@ -604,6 +1325,254 @@ class DhanAlgoEngine:
                 if self.order_reconnects == 1 or self.order_reconnects % 10 == 0:
                     self.event("INFO", self.order_last_error)
                 await asyncio.sleep(min(30, 3 + self.order_reconnects))
+
+    async def _broker_reconcile_worker(self) -> None:
+        while self.running:
+            try:
+                await self.reconcile_broker_state()
+            except asyncio.CancelledError:
+                break
+            except DhanAuthenticationError as exc:
+                self._handle_auth_failure("Broker reconciliation", exc)
+                break
+            except Exception as exc:
+                if _is_auth_error(exc):
+                    self._handle_auth_failure("Broker reconciliation", exc)
+                    break
+                self.broker_reconcile_status = {
+                    **self.broker_reconcile_status,
+                    "running": False,
+                    "message": f"Broker reconcile failed: {exc}",
+                    "last_run": datetime.now(IST).isoformat(),
+                }
+                self.event("WARN", self.broker_reconcile_status["message"])
+            await asyncio.sleep(20)
+
+    async def reconcile_broker_state(self, startup: bool = False) -> dict[str, Any]:
+        if self.settings.dry_run:
+            self.locked_symbols = set()
+            self.broker_reconcile_status = {
+                "running": False,
+                "message": "Dry run: broker reconciliation skipped",
+                "last_run": datetime.now(IST).isoformat(),
+                "mismatches": [],
+                "pending_orders": [],
+                "failed_orders": [],
+                "locked_symbols": [],
+            }
+            return self.broker_reconcile_status
+        if not self.client:
+            raise RuntimeError("Dhan client is not configured.")
+        self.broker_reconcile_status = {
+            **self.broker_reconcile_status,
+            "running": True,
+            "message": "Checking broker positions and order book",
+        }
+        order_book = await self.client.order_book()
+        broker_positions = await self.client.positions()
+        for row in order_book:
+            self._update_ledger_order_from_broker(row)
+        await self._recover_pending_ledger_orders(order_book)
+        self._apply_unapplied_traded_orders()
+        broker_net = self._broker_net_quantities(broker_positions)
+        app_net = self._app_net_quantities()
+        relevant_sids = set(app_net) | set(broker_net) | self._ledger_security_ids() | set(self.instruments_by_security)
+        mismatches = []
+        for security_id in sorted(relevant_sids):
+            app_qty = int(app_net.get(security_id, 0))
+            broker_qty = int(broker_net.get(security_id, 0))
+            if app_qty != broker_qty:
+                mismatches.append(
+                    {
+                        "symbol": self._symbol_for_security(security_id),
+                        "security_id": security_id,
+                        "app_qty": app_qty,
+                        "broker_qty": broker_qty,
+                    }
+                )
+        pending_orders, failed_orders = self._relevant_order_lists(order_book)
+        new_locked = {
+            row["symbol"]
+            for row in mismatches
+            if row.get("symbol")
+        } | {
+            row.get("symbol", "")
+            for row in pending_orders
+            if row.get("symbol")
+        }
+        previous_locked = set(self.locked_symbols)
+        self.locked_symbols = {symbol for symbol in new_locked if symbol}
+        if self.locked_symbols and self.locked_symbols != previous_locked:
+            self.event("ERROR", f"Broker/app mismatch lock active: {', '.join(sorted(self.locked_symbols))}")
+        message = (
+            f"Broker reconcile mismatch: {len(mismatches)} symbols locked"
+            if mismatches or pending_orders
+            else "Broker reconcile OK"
+        )
+        if startup and (mismatches or pending_orders):
+            message = "Startup " + message.lower()
+        self.broker_positions = broker_net
+        self.broker_reconcile_status = {
+            "running": False,
+            "message": message,
+            "last_run": datetime.now(IST).isoformat(),
+            "mismatches": mismatches,
+            "pending_orders": pending_orders,
+            "failed_orders": failed_orders,
+            "locked_symbols": sorted(self.locked_symbols),
+        }
+        return self.broker_reconcile_status
+
+    async def _recover_pending_ledger_orders(self, order_book: list[dict[str, Any]]) -> None:
+        by_correlation = {_broker_correlation_id(row): row for row in order_book if _broker_correlation_id(row)}
+        by_order_id = {_broker_order_id(row): row for row in order_book if _broker_order_id(row)}
+        for correlation_id, record in list((self.ledger.get("orders") or {}).items()):
+            status = str(record.get("status") or "").upper()
+            if status in FINAL_ORDER_STATUSES:
+                continue
+            row = by_correlation.get(correlation_id) or by_order_id.get(str(record.get("order_id") or ""))
+            if not row and correlation_id:
+                try:
+                    assert self.client is not None
+                    row = await self.client.order_by_correlation_id(correlation_id)
+                except Exception:
+                    row = None
+            if isinstance(row, dict) and row:
+                self._update_ledger_order_from_broker(row, correlation_id)
+
+    def _apply_unapplied_traded_orders(self) -> None:
+        for correlation_id, record in list((self.ledger.get("orders") or {}).items()):
+            status = str(record.get("status") or "").upper()
+            if status not in TRADED_STATUSES or record.get("applied_to_position"):
+                continue
+            role = str(record.get("order_role") or "").upper()
+            position_key = str(record.get("position_key") or "")
+            metadata = record.get("metadata") or {}
+            fill_price = float(record.get("average_price") or metadata.get("reference_price") or 0)
+            quantity = int(record.get("traded_quantity") or record.get("quantity") or 0)
+            if role == "ENTRY":
+                self._recover_entry_position(position_key, record, metadata, fill_price, quantity)
+            elif role == "PYRAMID":
+                self._recover_pyramid_position(position_key, record, fill_price, quantity)
+            elif role == "EXIT":
+                position = self.positions.get(position_key)
+                if position:
+                    position.status = "CLOSED"
+                    position.exit_order_id = str(record.get("order_id") or "")
+                    position.exit_reason = str(metadata.get("reason") or "RECOVERED_EXIT")
+                    self._persist_position(position)
+            self._mark_latest_order_applied(correlation_id)
+
+    def _recover_entry_position(self, position_key: str, record: dict[str, Any], metadata: dict[str, Any], fill_price: float, quantity: int) -> None:
+        if position_key in self.positions and self.positions[position_key].status == "OPEN":
+            return
+        payload = metadata.get("position") or {}
+        side = str(payload.get("side") or ("SHORT" if record.get("transaction_type") == "SELL" else "LONG")).upper()
+        symbol = str(record.get("symbol") or payload.get("symbol") or "")
+        entry = float(fill_price or payload.get("entry_price") or 0)
+        stop = float(payload.get("stop_loss") or 0)
+        target = float(payload.get("target") or 0)
+        position = Position(
+            symbol=symbol,
+            security_id=str(record.get("security_id") or ""),
+            side=side,
+            strategy=str(payload.get("strategy") or "recovered_entry"),
+            entry_price=round(entry, 2),
+            quantity=max(0, int(quantity or payload.get("quantity") or 0)),
+            stop_loss=round(stop, 2),
+            target=round(target, 2),
+            opened_at=str(record.get("updated_at") or datetime.now(IST).isoformat()),
+            order_id=str(record.get("order_id") or ""),
+            last_price=round(entry, 2),
+            meta={"recovered": True, **{k: v for k, v in payload.items() if k not in {"symbol"}}},
+        )
+        if position.symbol and position.quantity > 0:
+            self.positions[position_key or self._position_key(position.symbol, position.side)] = position
+            self._persist_position(position)
+
+    def _recover_pyramid_position(self, position_key: str, record: dict[str, Any], fill_price: float, quantity: int) -> None:
+        position = self.positions.get(position_key)
+        if not position or quantity <= 0:
+            return
+        old_quantity = int(position.quantity)
+        new_quantity = old_quantity + quantity
+        price = float(fill_price or position.last_price or position.entry_price)
+        if new_quantity > 0:
+            position.entry_price = round(((position.entry_price * old_quantity) + (price * quantity)) / new_quantity, 2)
+            position.quantity = new_quantity
+            position.meta["pyramid_adds"] = int(position.meta.get("pyramid_adds") or 0) + 1
+            position.meta.setdefault("pyramid_orders", []).append(
+                {"order_id": str(record.get("order_id") or ""), "quantity": quantity, "price": price, "status": record.get("status")}
+            )
+            if position.strategy in {"scalper_long", "scalper_short"}:
+                self._refresh_scalper_risk(position)
+            self._persist_position(position)
+
+    def _broker_net_quantities(self, rows: list[dict[str, Any]]) -> dict[str, int]:
+        broker_net: dict[str, int] = {}
+        for row in rows:
+            security_id = str(row.get("securityId") or row.get("security_id") or "")
+            if not security_id:
+                continue
+            product_type = str(row.get("productType") or "").upper()
+            if product_type and product_type != "INTRADAY":
+                continue
+            net_qty = _broker_quantity(row, "netQty", "netQuantity")
+            if net_qty:
+                broker_net[security_id] = broker_net.get(security_id, 0) + net_qty
+        return broker_net
+
+    def _app_net_quantities(self) -> dict[str, int]:
+        app_net: dict[str, int] = {}
+        for position in self.positions.values():
+            if position.status != "OPEN":
+                continue
+            sign = -1 if position.side == "SHORT" else 1
+            app_net[str(position.security_id)] = app_net.get(str(position.security_id), 0) + sign * int(position.quantity)
+        return app_net
+
+    def _ledger_security_ids(self) -> set[str]:
+        ids = {str(record.get("security_id") or "") for record in (self.ledger.get("orders") or {}).values()}
+        ids.update(str(row.get("security_id") or "") for row in (self.ledger.get("positions") or {}).values())
+        return {item for item in ids if item}
+
+    def _symbol_for_security(self, security_id: str) -> str:
+        instrument = self.instruments_by_security.get(str(security_id))
+        if instrument:
+            return instrument.symbol
+        for position in self.positions.values():
+            if str(position.security_id) == str(security_id):
+                return position.symbol
+        for record in (self.ledger.get("orders") or {}).values():
+            if str(record.get("security_id") or "") == str(security_id):
+                return str(record.get("symbol") or security_id)
+        return str(security_id)
+
+    def _relevant_order_lists(self, order_book: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        ledger_correlations = set((self.ledger.get("orders") or {}).keys())
+        relevant_security_ids = self._ledger_security_ids() | set(self.instruments_by_security)
+        pending = []
+        failed = []
+        for row in order_book:
+            correlation_id = _broker_correlation_id(row)
+            security_id = str(row.get("securityId") or row.get("security_id") or "")
+            if correlation_id not in ledger_correlations and security_id not in relevant_security_ids:
+                continue
+            status = _broker_order_status(row)
+            item = {
+                "symbol": self._symbol_for_security(security_id),
+                "security_id": security_id,
+                "order_id": _broker_order_id(row),
+                "correlation_id": correlation_id,
+                "status": status,
+                "transaction_type": str(row.get("transactionType") or ""),
+                "quantity": _broker_quantity(row, "quantity"),
+            }
+            if status in PENDING_STATUSES or status in PENDING_LEDGER_STATUSES:
+                pending.append(item)
+            elif status in FAILED_STATUSES:
+                failed.append(item)
+        return pending, failed
 
     async def _auto_reconcile_worker(self) -> None:
         while self.running:
@@ -1037,8 +2006,16 @@ class DhanAlgoEngine:
         rows.sort(key=lambda item: item["change"] if item["change"] is not None else -999999, reverse=True)
         return rows
 
-    def _has_open_position(self, symbol: str) -> bool:
-        return any(p.symbol == symbol and p.status == "OPEN" for p in self.positions.values())
+    def _open_positions_for_symbol(self, symbol: str) -> list[Position]:
+        return [p for p in self.positions.values() if p.symbol == symbol and p.status == "OPEN"]
+
+    def _has_open_position(self, symbol: str, side: str | None = None) -> bool:
+        return any(
+            p.symbol == symbol
+            and p.status == "OPEN"
+            and (side is None or p.side == side)
+            for p in self.positions.values()
+        )
 
     def event(self, kind: str, message: str) -> None:
         self.events.insert(0, {"time": datetime.now(IST).isoformat(), "kind": kind, "message": message})
@@ -1058,6 +2035,7 @@ class DhanAlgoEngine:
                         "price": self.candles.latest_price(symbol),
                         "candles_1m": len(self.candles.closed_candles(symbol, 1)),
                         "candles_5m": len(self.candles.closed_candles(symbol, 5)),
+                        "locked": symbol in self.locked_symbols,
                     }
                 )
             premarket = dict(self.premarket_status)
@@ -1087,6 +2065,9 @@ class DhanAlgoEngine:
                 "events": self.events[:80],
                 "premarket": premarket,
                 "reconcile": self.reconcile_status,
+                "broker_reconcile": self.broker_reconcile_status,
+                "locked_symbols": sorted(self.locked_symbols),
+                "ledger_file": str(TRADE_LEDGER_FILE),
             }
 
 

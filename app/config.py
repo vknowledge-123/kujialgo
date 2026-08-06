@@ -6,6 +6,7 @@ DATA_DIR = Path("data")
 STATE_FILE = DATA_DIR / "state.json"
 PREMARKET_FILE = DATA_DIR / "premarket_cache.json"
 PREMARKET_REPORT_FILE = DATA_DIR / "premarket_cache_report.json"
+TRADE_LEDGER_FILE = DATA_DIR / "trade_ledger.json"
 SCRIP_MASTER_FILE = DATA_DIR / "dhan_scrip_master.csv"
 
 DHAN_API_BASE_URL = "https://api.dhan.co/v2"

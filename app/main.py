@@ -70,3 +70,12 @@ async def reconcile(symbol: str):
         return await engine.reconcile_missing_candles(symbol)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/broker-reconcile")
+async def broker_reconcile():
+    try:
+        await engine.reconcile_broker_state()
+        return engine.snapshot()
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

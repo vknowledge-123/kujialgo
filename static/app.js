@@ -37,6 +37,9 @@ function payload(options = {}) {
       near_high_percent: Number($("nearHigh").value || 70),
       volume_multiplier: Number($("volumeMultiplier").value || 8),
       fixed_sl_percent: Number($("fixedSl").value || 0.7),
+      scalper_sl_percent: Number($("scalperSl").value || 0.8),
+      scalper_pyramiding: $("scalperPyramiding").checked,
+      scalper_max_adds: Number($("scalperMaxAdds").value || 2),
       risk_reward: Number($("riskReward").value || 3),
       use_sector_filter: $("sectorFilter").checked,
       top_sector_count: Number($("topSectorCount").value || 2),
@@ -117,6 +120,7 @@ function render(data) {
   $("feedState").className = data.market_connected ? "pill" : "pill muted";
   $("orderState").textContent = data.order_connected ? "Orders Live" : (data.order_last_error ? "Orders Reconnecting" : "Orders Off");
   $("orderState").className = data.order_connected ? "pill" : "pill muted";
+  renderBrokerAlert(data.broker_reconcile || {});
 
   $("positions").innerHTML = (data.positions || []).map((p) => `
     <tr>
@@ -128,9 +132,9 @@ function render(data) {
   $("instruments").innerHTML = (data.latest || []).map((r) => `
     <tr>
       <td>${r.symbol}</td><td>${r.security_id}</td><td>${r.sector || "-"}</td>
-      <td>${money(r.price)}</td><td>${r.candles_1m}</td><td>${r.candles_5m}</td>
+      <td>${money(r.price)}</td><td>${r.candles_1m}</td><td>${r.candles_5m}</td><td>${r.locked ? "LOCKED" : "-"}</td>
     </tr>
-  `).join("") || `<tr><td colspan="6">No resolved instruments yet</td></tr>`;
+  `).join("") || `<tr><td colspan="7">No resolved instruments yet</td></tr>`;
 
   $("sectors").innerHTML = (data.sectors || []).map((r) => `
     <tr>
@@ -144,6 +148,7 @@ function render(data) {
   if (data.order_last_error && !data.order_connected) events.unshift({ kind: "INFO", time: new Date().toISOString(), message: data.order_last_error });
   if (data.premarket?.message) events.unshift({ kind: "INFO", time: new Date().toISOString(), message: `Premarket: ${data.premarket.message} (${data.premarket.progress || 0}%)` });
   if (data.reconcile?.message) events.unshift({ kind: "INFO", time: data.reconcile.last_run || new Date().toISOString(), message: `Reconcile: ${data.reconcile.message}` });
+  if (data.broker_reconcile?.message) events.unshift({ kind: data.broker_reconcile.locked_symbols?.length ? "ERROR" : "INFO", time: data.broker_reconcile.last_run || new Date().toISOString(), message: `Broker: ${data.broker_reconcile.message}` });
   $("events").innerHTML = events.slice(0, 40).map((e) => `
     <div class="event ${e.kind}">
       <time>${formatTime(e.time)} - ${e.kind}</time>
@@ -164,9 +169,12 @@ function render(data) {
     setInputValue("nearHigh", data.settings.near_high_percent || 70);
     setInputValue("volumeMultiplier", data.settings.volume_multiplier || 8);
     setInputValue("fixedSl", data.settings.fixed_sl_percent || 0.7);
+    setInputValue("scalperSl", data.settings.scalper_sl_percent || 0.8);
     setInputValue("riskReward", data.settings.risk_reward || 3);
+    setInputValue("scalperMaxAdds", data.settings.scalper_max_adds ?? 2);
     setInputValue("topSectorCount", data.settings.top_sector_count || 2);
     $("dryRun").checked = Boolean(data.settings.dry_run);
+    $("scalperPyramiding").checked = Boolean(data.settings.scalper_pyramiding);
     $("sectorFilter").checked = Boolean(data.settings.use_sector_filter);
     document.querySelectorAll(".strategy").forEach((input) => {
       input.checked = Boolean((data.settings.enabled || {})[input.dataset.key]);
@@ -187,6 +195,27 @@ function render(data) {
     $("shortText").value = data.short_symbols.join("\n");
   }
   state.applyingRemote = false;
+}
+
+function renderBrokerAlert(status) {
+  const alert = $("brokerAlert");
+  const locked = status.locked_symbols || [];
+  const mismatches = status.mismatches || [];
+  const pending = status.pending_orders || [];
+  if (!locked.length && !mismatches.length && !pending.length) {
+    alert.classList.add("hidden");
+    alert.innerHTML = "";
+    return;
+  }
+  alert.classList.remove("hidden");
+  const mismatchText = mismatches.map((row) => `${row.symbol}: app ${row.app_qty}, broker ${row.broker_qty}`).join(" | ");
+  const pendingText = pending.map((row) => `${row.symbol}: ${row.status} ${row.quantity}`).join(" | ");
+  alert.innerHTML = `
+    <strong>Broker/app reconciliation lock active</strong>
+    <div>New entries are blocked for: ${escapeHtml(locked.join(", "))}</div>
+    ${mismatchText ? `<div>Mismatches: ${escapeHtml(mismatchText)}</div>` : ""}
+    ${pendingText ? `<div>Pending orders: ${escapeHtml(pendingText)}</div>` : ""}
+  `;
 }
 
 function renderPremarketSummary(premarket) {
@@ -295,12 +324,12 @@ document.querySelectorAll(".tf").forEach((button) => {
   });
 });
 
-["perTradeCapital", "perTradeRisk", "smaPeriod", "nearHigh", "volumeMultiplier", "fixedSl", "riskReward", "topSectorCount"].forEach((id) => {
+["perTradeCapital", "perTradeRisk", "smaPeriod", "nearHigh", "volumeMultiplier", "fixedSl", "scalperSl", "riskReward", "scalperMaxAdds", "topSectorCount"].forEach((id) => {
   $(id).addEventListener("input", () => scheduleSave(400));
   $(id).addEventListener("change", () => scheduleSave(0));
 });
 
-["dryRun", "sectorFilter"].forEach((id) => {
+["dryRun", "scalperPyramiding", "sectorFilter"].forEach((id) => {
   $(id).addEventListener("change", () => scheduleSave(0));
 });
 
@@ -338,6 +367,9 @@ $("premarket").addEventListener("click", async () => {
 });
 $("refreshReport").addEventListener("click", async () => {
   try { await refreshPremarketReport(); } catch (err) { alert(err.message); }
+});
+$("brokerReconcile").addEventListener("click", async () => {
+  try { render(await api("/api/broker-reconcile", { method: "POST", body: "{}" })); } catch (err) { alert(err.message); }
 });
 
 async function poll() {

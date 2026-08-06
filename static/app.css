@@ -51,6 +51,23 @@ p { margin: 6px 0 0; color: var(--muted); }
 }
 .live-grid { grid-template-columns: 1.2fr 1fr 1fr .8fr; }
 .cache-report-section { grid-template-columns: 1fr; }
+.broker-alert {
+  border: 1px solid #f3b4ad;
+  border-left: 5px solid var(--danger);
+  background: #fff4f2;
+  color: var(--danger);
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin-bottom: 16px;
+  font-size: 13px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.broker-alert strong {
+  display: block;
+  margin-bottom: 4px;
+}
+.hidden { display: none; }
 .panel {
   background: var(--panel);
   border: 1px solid var(--line);

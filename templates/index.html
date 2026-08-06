@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Koju Dhan Algo</title>
-  <link rel="stylesheet" href="/static/app.css?v=20260803-cache-report">
+  <link rel="stylesheet" href="/static/app.css?v=20260806-broker-reconcile">
 </head>
 <body>
   <main class="shell">
@@ -49,12 +49,15 @@
           <label>Near high % <input id="nearHigh" type="number" min="1" max="100" value="70"></label>
           <label>Volume x <input id="volumeMultiplier" type="number" min="0" step="0.1" value="8"></label>
           <label>Fixed SL % <input id="fixedSl" type="number" min="0" step="0.1" value="0.7"></label>
+          <label>Scalper SL % <input id="scalperSl" type="number" min="0.1" step="0.1" value="0.8"></label>
           <label>Risk reward <input id="riskReward" type="number" min="0.1" step="0.1" value="3"></label>
+          <label>Pyramid max adds <input id="scalperMaxAdds" type="number" min="0" step="1" value="2"></label>
         </div>
         <div class="toggles">
           <label><input id="dryRun" type="checkbox" checked> Dry run</label>
           <label><input id="capitalSizing" name="sizingMode" type="radio" checked> Capital sizing</label>
           <label><input id="riskSizing" name="sizingMode" type="radio"> Risk sizing</label>
+          <label><input id="scalperPyramiding" type="checkbox"> Scalper pyramiding</label>
           <label><input id="sectorFilter" type="checkbox"> Sector filter</label>
           <label>Top sectors <input id="topSectorCount" type="number" min="1" value="2"></label>
         </div>
@@ -67,6 +70,8 @@
           <label><input class="strategy" data-key="long_s2" type="checkbox" checked> Long Strategy 2</label>
           <label><input class="strategy" data-key="long_s3" type="checkbox" checked> Long Strategy 3</label>
           <label><input class="strategy" data-key="long_s4" type="checkbox" checked> Long Strategy 4</label>
+          <label><input class="strategy" data-key="scalper_long" type="checkbox"> Scalper Long</label>
+          <label><input class="strategy" data-key="scalper_short" type="checkbox"> Scalper Short</label>
           <label class="disabled"><input class="strategy" data-key="short_s1" type="checkbox"> Short Strategy 1</label>
           <label class="disabled"><input class="strategy" data-key="short_s2" type="checkbox"> Short Strategy 2</label>
           <label class="disabled"><input class="strategy" data-key="short_s3" type="checkbox"> Short Strategy 3</label>
@@ -75,9 +80,12 @@
         <div class="button-row primary-row">
           <button id="startAlgo" class="primary">Start Algo</button>
           <button id="stopAlgo" class="danger">Stop Algo</button>
+          <button id="brokerReconcile" class="secondary">Broker Reconcile</button>
         </div>
       </div>
     </section>
+
+    <section id="brokerAlert" class="broker-alert hidden"></section>
 
     <section class="watchlists">
       <div class="panel">
@@ -138,7 +146,7 @@
         <h2>Resolved Instruments</h2>
         <div class="table-wrap compact-table">
           <table>
-            <thead><tr><th>Symbol</th><th>Security ID</th><th>Sector</th><th>LTP</th><th>1m</th><th>5m</th></tr></thead>
+            <thead><tr><th>Symbol</th><th>Security ID</th><th>Sector</th><th>LTP</th><th>1m</th><th>5m</th><th>Lock</th></tr></thead>
             <tbody id="instruments"></tbody>
           </table>
         </div>
@@ -158,6 +166,6 @@
       </div>
     </section>
   </main>
-  <script src="/static/app.js?v=20260803-cache-report"></script>
+  <script src="/static/app.js?v=20260806-broker-reconcile"></script>
 </body>
 </html>

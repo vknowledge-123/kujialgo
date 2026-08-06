@@ -19,6 +19,9 @@ class StrategySettings:
     near_high_percent: float = 70.0
     volume_multiplier: float = 8.0
     fixed_sl_percent: float = 0.7
+    scalper_sl_percent: float = 0.8
+    scalper_pyramiding: bool = False
+    scalper_max_adds: int = 2
     candle_sl_max_percent: float = 1.0
     risk_reward: float = 3.0
     ema_period: int = 10
@@ -29,6 +32,8 @@ class StrategySettings:
         "long_s2": True,
         "long_s3": True,
         "long_s4": True,
+        "scalper_long": False,
+        "scalper_short": False,
         "short_s1": False,
         "short_s2": False,
         "short_s3": False,
@@ -54,6 +59,9 @@ class StrategySettings:
             near_high_percent=float(payload.get("near_high_percent") or current.near_high_percent),
             volume_multiplier=float(payload.get("volume_multiplier") or current.volume_multiplier),
             fixed_sl_percent=float(payload.get("fixed_sl_percent") or current.fixed_sl_percent),
+            scalper_sl_percent=max(0.1, float(payload.get("scalper_sl_percent") or current.scalper_sl_percent)),
+            scalper_pyramiding=bool(payload.get("scalper_pyramiding", current.scalper_pyramiding)),
+            scalper_max_adds=max(0, int(payload.get("scalper_max_adds") if payload.get("scalper_max_adds") is not None else current.scalper_max_adds)),
             candle_sl_max_percent=float(payload.get("candle_sl_max_percent") or current.candle_sl_max_percent),
             risk_reward=max(0.1, float(payload.get("risk_reward") or current.risk_reward)),
             ema_period=max(1, int(payload.get("ema_period") or current.ema_period)),
@@ -80,17 +88,17 @@ def setup_stop(entry: float, candle: Candle, settings: StrategySettings) -> tupl
     return round(stop, 2), round(target, 2)
 
 
-def calculate_quantity(entry: float, stop: float, settings: StrategySettings) -> tuple[int, str]:
+def calculate_quantity(entry: float, stop: float, settings: StrategySettings, side: str = "LONG") -> tuple[int, str]:
     entry = float(entry or 0)
     stop = float(stop or 0)
     if entry <= 0:
         return 0, "invalid entry price"
     if settings.sizing_mode == "risk":
-        per_share_risk = entry - stop
+        per_share_risk = abs(entry - stop)
         if per_share_risk <= 0:
-            return 0, "invalid risk because stop loss is not below entry"
+            return 0, "invalid risk because entry and stop loss are equal"
         quantity = math.floor(settings.per_trade_risk / per_share_risk)
-        return quantity, f"risk sizing: {settings.per_trade_risk:.2f} / {per_share_risk:.2f}"
+        return quantity, f"{side.lower()} risk sizing: {settings.per_trade_risk:.2f} / {per_share_risk:.2f}"
     quantity = math.floor(settings.per_trade_capital / entry)
     if quantity < 1:
         quantity = 1

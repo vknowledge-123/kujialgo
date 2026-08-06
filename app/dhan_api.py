@@ -57,7 +57,7 @@ class DhanClient:
         self.fetch_limiter = AsyncRateLimiter(FETCH_REQUESTS_PER_SECOND)
         self.order_limiter = AsyncRateLimiter(ORDER_REQUESTS_PER_SECOND)
 
-    async def get(self, path: str) -> dict[str, Any]:
+    async def get(self, path: str) -> Any:
         await self.fetch_limiter.wait()
         return await asyncio.to_thread(self._request, "GET", path, None)
 
@@ -79,7 +79,7 @@ class DhanClient:
         await (self.order_limiter if order else self.fetch_limiter).wait()
         return await asyncio.to_thread(self._request, "DELETE", path, None)
 
-    def _request(self, method: str, path: str, payload: dict[str, Any] | None) -> dict[str, Any]:
+    def _request(self, method: str, path: str, payload: dict[str, Any] | None) -> Any:
         response = self.http.request(
             method,
             f"{DHAN_API_BASE_URL}{path}",
@@ -183,6 +183,30 @@ class DhanClient:
 
     async def order_by_id(self, order_id: str) -> dict[str, Any]:
         return await self.get(f"/orders/{order_id}")
+
+    async def order_by_correlation_id(self, correlation_id: str) -> dict[str, Any]:
+        return await self.get(f"/orders/external/{correlation_id}")
+
+    async def order_book(self) -> list[dict[str, Any]]:
+        return list_response(await self.get("/orders"))
+
+    async def trade_book(self) -> list[dict[str, Any]]:
+        return list_response(await self.get("/trades"))
+
+    async def trades_by_order(self, order_id: str) -> list[dict[str, Any]]:
+        return list_response(await self.get(f"/trades/{order_id}"))
+
+    async def positions(self) -> list[dict[str, Any]]:
+        return list_response(await self.get("/positions"))
+
+
+def list_response(data: Any) -> list[dict[str, Any]]:
+    payload = data.get("data", data) if isinstance(data, dict) else data
+    if isinstance(payload, dict) and isinstance(payload.get("data"), list):
+        payload = payload["data"]
+    if isinstance(payload, list):
+        return [row for row in payload if isinstance(row, dict)]
+    return []
 
 
 def candles_from_response(data: dict[str, Any]) -> list[dict[str, Any]]:
