@@ -8,6 +8,7 @@ from typing import Any
 import requests
 
 from .config import (
+    BROKER_REQUESTS_PER_SECOND,
     DHAN_API_BASE_URL,
     DHAN_CONNECT_TIMEOUT_SECONDS,
     DHAN_READ_TIMEOUT_SECONDS,
@@ -57,10 +58,11 @@ class DhanClient:
             }
         )
         self.fetch_limiter = AsyncRateLimiter(FETCH_REQUESTS_PER_SECOND)
+        self.broker_limiter = AsyncRateLimiter(BROKER_REQUESTS_PER_SECOND)
         self.order_limiter = AsyncRateLimiter(ORDER_REQUESTS_PER_SECOND)
 
-    async def get(self, path: str) -> Any:
-        await self.fetch_limiter.wait()
+    async def get(self, path: str, broker: bool = False) -> Any:
+        await (self.broker_limiter if broker else self.fetch_limiter).wait()
         return await asyncio.to_thread(self._request, "GET", path, None)
 
     async def post(self, path: str, payload: dict[str, Any], order: bool = False) -> dict[str, Any]:
@@ -82,12 +84,10 @@ class DhanClient:
         return await asyncio.to_thread(self._request, "DELETE", path, None)
 
     def _request(self, method: str, path: str, payload: dict[str, Any] | None) -> Any:
-        response = self.http.request(
-            method,
-            f"{DHAN_API_BASE_URL}{path}",
-            json=payload,
-            timeout=(DHAN_CONNECT_TIMEOUT_SECONDS, DHAN_READ_TIMEOUT_SECONDS),
-        )
+        kwargs: dict[str, Any] = {"timeout": (DHAN_CONNECT_TIMEOUT_SECONDS, DHAN_READ_TIMEOUT_SECONDS)}
+        if payload is not None:
+            kwargs["json"] = payload
+        response = self.http.request(method, f"{DHAN_API_BASE_URL}{path}", **kwargs)
         if response.status_code == 429:
             raise DhanRateLimitError(f"Dhan API rate limited on {path}: {response.text[:300]}")
         if "DH-901" in response.text or "Invalid_Authentication" in response.text:
@@ -184,22 +184,22 @@ class DhanClient:
         return await self.delete(f"/orders/{order_id}", order=True)
 
     async def order_by_id(self, order_id: str) -> dict[str, Any]:
-        return await self.get(f"/orders/{order_id}")
+        return await self.get(f"/orders/{order_id}", broker=True)
 
     async def order_by_correlation_id(self, correlation_id: str) -> dict[str, Any]:
-        return await self.get(f"/orders/external/{correlation_id}")
+        return await self.get(f"/orders/external/{correlation_id}", broker=True)
 
     async def order_book(self) -> list[dict[str, Any]]:
-        return list_response(await self.get("/orders"))
+        return list_response(await self.get("/orders", broker=True))
 
     async def trade_book(self) -> list[dict[str, Any]]:
-        return list_response(await self.get("/trades"))
+        return list_response(await self.get("/trades", broker=True))
 
     async def trades_by_order(self, order_id: str) -> list[dict[str, Any]]:
-        return list_response(await self.get(f"/trades/{order_id}"))
+        return list_response(await self.get(f"/trades/{order_id}", broker=True))
 
     async def positions(self) -> list[dict[str, Any]]:
-        return list_response(await self.get("/positions"))
+        return list_response(await self.get("/positions", broker=True))
 
 
 def list_response(data: Any) -> list[dict[str, Any]]:

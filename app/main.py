@@ -5,7 +5,7 @@ from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .config import START_API_TIMEOUT_SECONDS
+from .config import BROKER_RECONCILE_TIMEOUT_SECONDS, START_API_TIMEOUT_SECONDS
 from .engine import DhanAlgoEngine
 from .symbols import extract_symbols
 
@@ -83,7 +83,18 @@ async def reconcile(symbol: str):
 @app.post("/api/broker-reconcile")
 async def broker_reconcile():
     try:
-        await engine.reconcile_broker_state()
+        await asyncio.wait_for(engine.reconcile_broker_state(), timeout=BROKER_RECONCILE_TIMEOUT_SECONDS)
         return engine.snapshot()
+    except asyncio.TimeoutError as exc:
+        message = f"Broker reconcile timed out after {BROKER_RECONCILE_TIMEOUT_SECONDS:g}s."
+        engine.entries_blocked_until_reconcile = True
+        engine.broker_reconcile_status = {
+            **engine.broker_reconcile_status,
+            "running": False,
+            "message": message,
+            "entries_blocked_until_reconcile": True,
+        }
+        engine.event("WARN", message)
+        raise HTTPException(status_code=504, detail=message) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

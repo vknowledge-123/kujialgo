@@ -11,6 +11,8 @@ import websockets
 
 from .candles import CandleStore, IST, SESSION_OPEN, expected_starts_for_day, to_ist
 from .config import (
+    BROKER_PENDING_LOOKUP_LIMIT,
+    BROKER_RECONCILE_TIMEOUT_SECONDS,
     DHAN_FEED_URL,
     DHAN_ORDER_UPDATE_URL,
     MAX_INSTRUMENTS_PER_CONNECTION,
@@ -19,7 +21,6 @@ from .config import (
     PREMARKET_FILE,
     PREMARKET_REPORT_FILE,
     STATE_FILE,
-    STARTUP_BROKER_RECONCILE_TIMEOUT_SECONDS,
     TICK_QUEUE_MAXSIZE,
     TICK_QUEUE_WARN_INTERVAL_SECONDS,
     TRADE_LEDGER_FILE,
@@ -38,7 +39,7 @@ from .symbols import (
 
 EXCHANGE_SEGMENT_CODES = {0: "IDX_I", 1: "NSE_EQ", 4: "BSE_EQ"}
 TRADED_STATUSES = {"TRADED", "COMPLETED"}
-FAILED_STATUSES = {"REJECTED", "CANCELLED", "EXPIRED", "FAILED"}
+FAILED_STATUSES = {"REJECTED", "CANCELLED", "EXPIRED", "FAILED", "STALE_UNRESOLVED"}
 PENDING_STATUSES = {"TRANSIT", "PENDING"}
 FINAL_ORDER_STATUSES = TRADED_STATUSES | FAILED_STATUSES
 PENDING_LEDGER_STATUSES = {"PENDING_ENTRY", "PENDING_EXIT", "PENDING_PYRAMID", "PENDING_ORDER", "TRANSIT", "PENDING"}
@@ -1529,7 +1530,7 @@ class DhanAlgoEngine:
             try:
                 await asyncio.wait_for(
                     self.reconcile_broker_state(),
-                    timeout=STARTUP_BROKER_RECONCILE_TIMEOUT_SECONDS,
+                    timeout=BROKER_RECONCILE_TIMEOUT_SECONDS,
                 )
             except asyncio.CancelledError:
                 break
@@ -1538,7 +1539,7 @@ class DhanAlgoEngine:
                 self.broker_reconcile_status = {
                     **self.broker_reconcile_status,
                     "running": False,
-                    "message": f"Broker reconcile timed out after {STARTUP_BROKER_RECONCILE_TIMEOUT_SECONDS:g}s; new entries are blocked until broker reconcile succeeds.",
+                    "message": f"Broker reconcile timed out after {BROKER_RECONCILE_TIMEOUT_SECONDS:g}s; new entries are blocked until broker reconcile succeeds.",
                     "last_run": datetime.now(IST).isoformat(),
                     "entries_blocked_until_reconcile": True,
                 }
@@ -1581,13 +1582,24 @@ class DhanAlgoEngine:
         self.broker_reconcile_status = {
             **self.broker_reconcile_status,
             "running": True,
-            "message": "Checking broker positions and order book",
+            "message": "Checking broker order book",
         }
-        order_book = await self.client.order_book()
-        broker_positions = await self.client.positions()
+        timings: dict[str, float] = {}
+        order_book = await self._timed_broker_call("order book", self.client.order_book, timings)
+        self.broker_reconcile_status = {
+            **self.broker_reconcile_status,
+            "message": "Checking broker positions",
+            "timings": timings,
+        }
+        broker_positions = await self._timed_broker_call("positions", self.client.positions, timings)
         for row in order_book:
             self._update_ledger_order_from_broker(row)
-        await self._recover_pending_ledger_orders(order_book)
+        self.broker_reconcile_status = {
+            **self.broker_reconcile_status,
+            "message": "Recovering pending ledger orders",
+            "timings": timings,
+        }
+        pending_recovery = await self._recover_pending_ledger_orders(order_book, timings)
         self._apply_unapplied_traded_orders()
         broker_net = self._broker_net_quantities(broker_positions)
         app_net = self._app_net_quantities()
@@ -1637,25 +1649,68 @@ class DhanAlgoEngine:
             "failed_orders": failed_orders,
             "locked_symbols": sorted(self.locked_symbols),
             "entries_blocked_until_reconcile": self.entries_blocked_until_reconcile,
+            "timings": timings,
+            "pending_recovery": pending_recovery,
         }
         return self.broker_reconcile_status
 
-    async def _recover_pending_ledger_orders(self, order_book: list[dict[str, Any]]) -> None:
+    async def _timed_broker_call(self, label: str, factory: Any, timings: dict[str, float]) -> Any:
+        started = time.monotonic()
+        result = await factory()
+        elapsed = round(time.monotonic() - started, 3)
+        timings[label] = elapsed
+        if elapsed >= 5:
+            self.event("WARN", f"Broker reconcile {label} took {elapsed:.1f}s.")
+        return result
+
+    def _ledger_order_is_from_today(self, record: dict[str, Any]) -> bool:
+        today = _today_key()
+        for field in ("created_at", "updated_at"):
+            value = str(record.get(field) or "")
+            if value.startswith(today):
+                return True
+        return False
+
+    async def _recover_pending_ledger_orders(self, order_book: list[dict[str, Any]], timings: dict[str, float] | None = None) -> dict[str, int]:
         by_correlation = {_broker_correlation_id(row): row for row in order_book if _broker_correlation_id(row)}
         by_order_id = {_broker_order_id(row): row for row in order_book if _broker_order_id(row)}
+        checked_external = 0
+        matched = 0
+        stale = 0
+        deferred = 0
         for correlation_id, record in list((self.ledger.get("orders") or {}).items()):
             status = str(record.get("status") or "").upper()
             if status in FINAL_ORDER_STATUSES:
                 continue
             row = by_correlation.get(correlation_id) or by_order_id.get(str(record.get("order_id") or ""))
+            if not row and not self._ledger_order_is_from_today(record):
+                self._update_ledger_order(
+                    correlation_id,
+                    {
+                        "status": "STALE_UNRESOLVED",
+                        "error_message": "Pending order was not present in current Dhan order book and is from a previous session.",
+                    },
+                )
+                stale += 1
+                continue
             if not row and correlation_id:
+                if checked_external >= BROKER_PENDING_LOOKUP_LIMIT:
+                    deferred += 1
+                    continue
                 try:
                     assert self.client is not None
+                    started = time.monotonic()
                     row = await self.client.order_by_correlation_id(correlation_id)
+                    checked_external += 1
+                    if timings is not None:
+                        timings["pending external lookups"] = round(timings.get("pending external lookups", 0) + (time.monotonic() - started), 3)
                 except Exception:
+                    checked_external += 1
                     row = None
             if isinstance(row, dict) and row:
                 self._update_ledger_order_from_broker(row, correlation_id)
+                matched += 1
+        return {"matched": matched, "external_checked": checked_external, "stale_marked": stale, "deferred": deferred}
 
     def _apply_unapplied_traded_orders(self) -> None:
         for correlation_id, record in list((self.ledger.get("orders") or {}).items()):
