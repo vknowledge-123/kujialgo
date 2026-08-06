@@ -19,6 +19,7 @@ from .config import (
     PREMARKET_FILE,
     PREMARKET_REPORT_FILE,
     STATE_FILE,
+    STARTUP_BROKER_RECONCILE_TIMEOUT_SECONDS,
     TICK_QUEUE_MAXSIZE,
     TICK_QUEUE_WARN_INTERVAL_SECONDS,
     TRADE_LEDGER_FILE,
@@ -612,6 +613,7 @@ class DhanAlgoEngine:
         if self.running:
             self.event("INFO", "Algo is already running.")
             return self.snapshot()
+        self.event("INFO", "Start requested; running startup checks.")
         self.loop = asyncio.get_running_loop()
         self.tick_queue = asyncio.Queue(maxsize=TICK_QUEUE_MAXSIZE)
         if not self.client:
@@ -626,7 +628,34 @@ class DhanAlgoEngine:
         subscription_count = len(self.instruments_by_symbol) + len(self.sector_instruments)
         if subscription_count > max_subscriptions:
             raise RuntimeError(f"Dhan supports {max_subscriptions} instruments across {MAX_MARKET_FEED_CONNECTIONS} feed connections.")
-        await self.reconcile_broker_state(startup=True)
+        self.event("INFO", "Startup broker reconcile: checking Dhan order book and positions.")
+        try:
+            await asyncio.wait_for(
+                self.reconcile_broker_state(startup=True),
+                timeout=STARTUP_BROKER_RECONCILE_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError as exc:
+            message = f"Startup broker reconcile timed out after {STARTUP_BROKER_RECONCILE_TIMEOUT_SECONDS:g}s. Check Dhan API/token/network, then start again."
+            self.last_error = message
+            self.broker_reconcile_status = {
+                **self.broker_reconcile_status,
+                "running": False,
+                "message": message,
+                "last_run": datetime.now(IST).isoformat(),
+            }
+            self.event("ERROR", message)
+            raise RuntimeError(message) from exc
+        except Exception as exc:
+            message = f"Startup broker reconcile failed: {exc}"
+            self.last_error = message
+            self.broker_reconcile_status = {
+                **self.broker_reconcile_status,
+                "running": False,
+                "message": message,
+                "last_run": datetime.now(IST).isoformat(),
+            }
+            self.event("ERROR", message)
+            raise
         self.running = True
         self.scalper_state = {}
         self.feed_generation += 1

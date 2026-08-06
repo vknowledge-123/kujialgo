@@ -9,6 +9,8 @@ import requests
 
 from .config import (
     DHAN_API_BASE_URL,
+    DHAN_CONNECT_TIMEOUT_SECONDS,
+    DHAN_READ_TIMEOUT_SECONDS,
     FETCH_REQUESTS_PER_SECOND,
     FETCH_RETRY_ATTEMPTS,
     FETCH_RETRY_BASE_SECONDS,
@@ -84,7 +86,7 @@ class DhanClient:
             method,
             f"{DHAN_API_BASE_URL}{path}",
             json=payload,
-            timeout=(5, 30),
+            timeout=(DHAN_CONNECT_TIMEOUT_SECONDS, DHAN_READ_TIMEOUT_SECONDS),
         )
         if response.status_code == 429:
             raise DhanRateLimitError(f"Dhan API rate limited on {path}: {response.text[:300]}")

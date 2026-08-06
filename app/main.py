@@ -1,8 +1,11 @@
+import asyncio
+
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
+from .config import START_API_TIMEOUT_SECONDS
 from .engine import DhanAlgoEngine
 from .symbols import extract_symbols
 
@@ -35,7 +38,12 @@ async def start_algo(payload: dict = Body(default={})):
     if payload:
         engine.configure(payload)
     try:
-        return await engine.start()
+        return await asyncio.wait_for(engine.start(), timeout=START_API_TIMEOUT_SECONDS)
+    except asyncio.TimeoutError as exc:
+        message = f"Start request timed out after {START_API_TIMEOUT_SECONDS:g}s."
+        engine.last_error = message
+        engine.event("ERROR", message)
+        raise HTTPException(status_code=504, detail=message) from exc
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
