@@ -11,6 +11,7 @@ import websockets
 
 from .candles import CandleStore, IST, SESSION_OPEN, expected_starts_for_day, to_ist
 from .config import (
+    ALLOW_POSITIONS_ONLY_RECONCILE,
     BROKER_PENDING_LOOKUP_LIMIT,
     BROKER_RECONCILE_TIMEOUT_SECONDS,
     DHAN_FEED_URL,
@@ -1579,30 +1580,43 @@ class DhanAlgoEngine:
             return self.broker_reconcile_status
         if not self.client:
             raise RuntimeError("Dhan client is not configured.")
+        timings: dict[str, float] = {}
         self.broker_reconcile_status = {
             **self.broker_reconcile_status,
             "running": True,
-            "message": "Checking broker order book",
-        }
-        timings: dict[str, float] = {}
-        order_book = await self._timed_broker_call("order book", self.client.order_book, timings)
-        self.broker_reconcile_status = {
-            **self.broker_reconcile_status,
             "message": "Checking broker positions",
-            "timings": timings,
         }
         broker_positions = await self._timed_broker_call("positions", self.client.positions, timings)
-        for row in order_book:
-            self._update_ledger_order_from_broker(row)
-        self.broker_reconcile_status = {
-            **self.broker_reconcile_status,
-            "message": "Recovering pending ledger orders",
-            "timings": timings,
-        }
-        pending_recovery = await self._recover_pending_ledger_orders(order_book, timings)
-        self._apply_unapplied_traded_orders()
         broker_net = self._broker_net_quantities(broker_positions)
         app_net = self._app_net_quantities()
+        active_ledger_orders = self._active_ledger_orders()
+        order_book: list[dict[str, Any]] = []
+        order_book_available = True
+        order_book_error = ""
+        self.broker_reconcile_status = {
+            **self.broker_reconcile_status,
+            "message": "Checking broker order book",
+            "timings": timings,
+        }
+        try:
+            order_book = await self._timed_broker_call("order book", self.client.order_book, timings)
+        except Exception as exc:
+            order_book_available = False
+            order_book_error = str(exc)
+            self.event("WARN", f"Broker order book unavailable: {order_book_error}")
+            if active_ledger_orders or not ALLOW_POSITIONS_ONLY_RECONCILE:
+                raise RuntimeError(f"Dhan order book unavailable and broker reconciliation cannot safely continue: {order_book_error}") from exc
+            pending_recovery = {"matched": 0, "external_checked": 0, "stale_marked": 0, "deferred": 0, "skipped": 1}
+        else:
+            for row in order_book:
+                self._update_ledger_order_from_broker(row)
+            self.broker_reconcile_status = {
+                **self.broker_reconcile_status,
+                "message": "Recovering pending ledger orders",
+                "timings": timings,
+            }
+            pending_recovery = await self._recover_pending_ledger_orders(order_book, timings)
+        self._apply_unapplied_traded_orders()
         relevant_sids = set(app_net) | set(broker_net) | self._ledger_security_ids() | set(self.instruments_by_security)
         mismatches = []
         for security_id in sorted(relevant_sids):
@@ -1617,7 +1631,7 @@ class DhanAlgoEngine:
                         "broker_qty": broker_qty,
                     }
                 )
-        pending_orders, failed_orders = self._relevant_order_lists(order_book)
+        pending_orders, failed_orders = self._relevant_order_lists(order_book) if order_book_available else ([], [])
         self.entries_blocked_until_reconcile = False
         new_locked = {
             row["symbol"]
@@ -1632,11 +1646,12 @@ class DhanAlgoEngine:
         self.locked_symbols = {symbol for symbol in new_locked if symbol}
         if self.locked_symbols and self.locked_symbols != previous_locked:
             self.event("ERROR", f"Broker/app mismatch lock active: {', '.join(sorted(self.locked_symbols))}")
-        message = (
-            f"Broker reconcile mismatch: {len(mismatches)} symbols locked"
-            if mismatches or pending_orders
-            else "Broker reconcile OK"
-        )
+        if mismatches or pending_orders:
+            message = f"Broker reconcile mismatch: {len(mismatches)} symbols locked"
+        elif order_book_available:
+            message = "Broker reconcile OK"
+        else:
+            message = f"Broker reconcile positions-only OK; Dhan order book unavailable: {order_book_error}"
         if startup and (mismatches or pending_orders):
             message = "Startup " + message.lower()
         self.broker_positions = broker_net
@@ -1651,6 +1666,8 @@ class DhanAlgoEngine:
             "entries_blocked_until_reconcile": self.entries_blocked_until_reconcile,
             "timings": timings,
             "pending_recovery": pending_recovery,
+            "order_book_available": order_book_available,
+            "order_book_error": order_book_error,
         }
         return self.broker_reconcile_status
 
@@ -1670,6 +1687,24 @@ class DhanAlgoEngine:
             if value.startswith(today):
                 return True
         return False
+
+    def _active_ledger_orders(self) -> list[dict[str, Any]]:
+        active = []
+        for correlation_id, record in list((self.ledger.get("orders") or {}).items()):
+            status = str(record.get("status") or "").upper()
+            if status in FINAL_ORDER_STATUSES:
+                continue
+            if not self._ledger_order_is_from_today(record):
+                self._update_ledger_order(
+                    correlation_id,
+                    {
+                        "status": "STALE_UNRESOLVED",
+                        "error_message": "Pending order was not present in current Dhan order book and is from a previous session.",
+                    },
+                )
+                continue
+            active.append(record)
+        return active
 
     async def _recover_pending_ledger_orders(self, order_book: list[dict[str, Any]], timings: dict[str, float] | None = None) -> dict[str, int]:
         by_correlation = {_broker_correlation_id(row): row for row in order_book if _broker_correlation_id(row)}

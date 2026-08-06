@@ -1,6 +1,10 @@
 from pathlib import Path
 import os
 
+
+def env_bool(name: str, default: str = "0") -> bool:
+    return str(os.getenv(name, default)).strip().lower() in {"1", "true", "yes", "on"}
+
 APP_NAME = "Koju Dhan Algo"
 DATA_DIR = Path("data")
 STATE_FILE = DATA_DIR / "state.json"
@@ -31,6 +35,7 @@ DHAN_READ_TIMEOUT_SECONDS = float(os.getenv("DHAN_READ_TIMEOUT_SECONDS", "12"))
 STARTUP_BROKER_RECONCILE_TIMEOUT_SECONDS = float(os.getenv("STARTUP_BROKER_RECONCILE_TIMEOUT_SECONDS", "8"))
 BROKER_RECONCILE_TIMEOUT_SECONDS = float(os.getenv("BROKER_RECONCILE_TIMEOUT_SECONDS", "75"))
 BROKER_PENDING_LOOKUP_LIMIT = int(os.getenv("BROKER_PENDING_LOOKUP_LIMIT", "3"))
+ALLOW_POSITIONS_ONLY_RECONCILE = env_bool("ALLOW_POSITIONS_ONLY_RECONCILE", "1")
 START_API_TIMEOUT_SECONDS = float(os.getenv("START_API_TIMEOUT_SECONDS", "20"))
 MAX_MARKET_FEED_CONNECTIONS = 5
 MAX_INSTRUMENTS_PER_CONNECTION = 5000

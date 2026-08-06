@@ -1,5 +1,6 @@
 import asyncio
 import json
+import threading
 import time
 from collections import deque
 from datetime import datetime
@@ -28,6 +29,10 @@ class DhanAuthenticationError(RuntimeError):
     pass
 
 
+class DhanTimeoutError(RuntimeError):
+    pass
+
+
 class AsyncRateLimiter:
     def __init__(self, calls_per_second: int):
         self.calls_per_second = max(1, int(calls_per_second))
@@ -48,15 +53,16 @@ class DhanClient:
     def __init__(self, client_id: str, access_token: str, session: requests.Session | None = None):
         self.client_id = str(client_id or "").strip()
         self.access_token = str(access_token or "").strip()
-        self.http = session or requests.Session()
-        self.http.headers.update(
-            {
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-                "access-token": self.access_token,
-                "client-id": self.client_id,
-            }
-        )
+        self.http = session
+        self.http_lock = threading.RLock()
+        self.headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+            "access-token": self.access_token,
+            "client-id": self.client_id,
+        }
+        if self.http is not None:
+            self.http.headers.update(self.headers)
         self.fetch_limiter = AsyncRateLimiter(FETCH_REQUESTS_PER_SECOND)
         self.broker_limiter = AsyncRateLimiter(BROKER_REQUESTS_PER_SECOND)
         self.order_limiter = AsyncRateLimiter(ORDER_REQUESTS_PER_SECOND)
@@ -87,7 +93,16 @@ class DhanClient:
         kwargs: dict[str, Any] = {"timeout": (DHAN_CONNECT_TIMEOUT_SECONDS, DHAN_READ_TIMEOUT_SECONDS)}
         if payload is not None:
             kwargs["json"] = payload
-        response = self.http.request(method, f"{DHAN_API_BASE_URL}{path}", **kwargs)
+        try:
+            if self.http is not None:
+                with self.http_lock:
+                    response = self.http.request(method, f"{DHAN_API_BASE_URL}{path}", headers=self.headers, **kwargs)
+            else:
+                response = requests.request(method, f"{DHAN_API_BASE_URL}{path}", headers=self.headers, **kwargs)
+        except requests.Timeout as exc:
+            raise DhanTimeoutError(f"Dhan API {path} timed out after {DHAN_CONNECT_TIMEOUT_SECONDS:g}s connect / {DHAN_READ_TIMEOUT_SECONDS:g}s read timeout") from exc
+        except requests.RequestException as exc:
+            raise RuntimeError(f"Dhan API {path} request failed: {exc}") from exc
         if response.status_code == 429:
             raise DhanRateLimitError(f"Dhan API rate limited on {path}: {response.text[:300]}")
         if "DH-901" in response.text or "Invalid_Authentication" in response.text:
