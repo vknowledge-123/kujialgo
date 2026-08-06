@@ -287,6 +287,7 @@ class DhanAlgoEngine:
         self.scalper_state: dict[str, dict[str, Any]] = {}
         self.ledger: dict[str, Any] = _empty_ledger()
         self.locked_symbols: set[str] = set()
+        self.entries_blocked_until_reconcile = False
         self.broker_positions: dict[str, dict[str, Any]] = {}
         self.broker_reconcile_status: dict[str, Any] = {
             "running": False,
@@ -296,6 +297,7 @@ class DhanAlgoEngine:
             "pending_orders": [],
             "failed_orders": [],
             "locked_symbols": [],
+            "entries_blocked_until_reconcile": False,
         }
         self.events: list[dict[str, Any]] = []
         self.premarket_status: dict[str, Any] = {"running": False, "message": "Not started", "progress": 0}
@@ -464,7 +466,14 @@ class DhanAlgoEngine:
         )
 
     def _is_symbol_locked(self, symbol: str) -> bool:
-        return symbol in self.locked_symbols
+        return self.entries_blocked_until_reconcile or symbol in self.locked_symbols
+
+    def _entry_block_reason(self, symbol: str) -> str:
+        if self.entries_blocked_until_reconcile:
+            return "broker reconciliation is pending"
+        if symbol in self.locked_symbols:
+            return "broker/app quantity mismatch is locked"
+        return ""
 
     def _extract_error_message(self, payload: Any) -> str:
         if payload is None:
@@ -542,6 +551,7 @@ class DhanAlgoEngine:
         self.event("ERROR", self.last_error)
         self.running = False
         self.feed_generation += 1
+        self.entries_blocked_until_reconcile = True
         self.client = None
         self.market_connected = False
         self.order_connected = False
@@ -550,6 +560,13 @@ class DhanAlgoEngine:
             "message": self.last_error,
             "last_run": datetime.now(IST).isoformat(),
             "last_missing": {},
+        }
+        self.broker_reconcile_status = {
+            **self.broker_reconcile_status,
+            "running": False,
+            "message": self.last_error,
+            "last_run": datetime.now(IST).isoformat(),
+            "entries_blocked_until_reconcile": True,
         }
         current = None
         try:
@@ -628,34 +645,17 @@ class DhanAlgoEngine:
         subscription_count = len(self.instruments_by_symbol) + len(self.sector_instruments)
         if subscription_count > max_subscriptions:
             raise RuntimeError(f"Dhan supports {max_subscriptions} instruments across {MAX_MARKET_FEED_CONNECTIONS} feed connections.")
-        self.event("INFO", "Startup broker reconcile: checking Dhan order book and positions.")
-        try:
-            await asyncio.wait_for(
-                self.reconcile_broker_state(startup=True),
-                timeout=STARTUP_BROKER_RECONCILE_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError as exc:
-            message = f"Startup broker reconcile timed out after {STARTUP_BROKER_RECONCILE_TIMEOUT_SECONDS:g}s. Check Dhan API/token/network, then start again."
-            self.last_error = message
+        if self.settings.dry_run:
+            self.entries_blocked_until_reconcile = False
+        else:
+            self.entries_blocked_until_reconcile = True
             self.broker_reconcile_status = {
                 **self.broker_reconcile_status,
                 "running": False,
-                "message": message,
-                "last_run": datetime.now(IST).isoformat(),
+                "message": "Startup broker reconcile queued; new entries are blocked until broker reconcile succeeds.",
+                "entries_blocked_until_reconcile": True,
             }
-            self.event("ERROR", message)
-            raise RuntimeError(message) from exc
-        except Exception as exc:
-            message = f"Startup broker reconcile failed: {exc}"
-            self.last_error = message
-            self.broker_reconcile_status = {
-                **self.broker_reconcile_status,
-                "running": False,
-                "message": message,
-                "last_run": datetime.now(IST).isoformat(),
-            }
-            self.event("ERROR", message)
-            raise
+            self.event("INFO", self.broker_reconcile_status["message"])
         self.running = True
         self.scalper_state = {}
         self.feed_generation += 1
@@ -877,7 +877,7 @@ class DhanAlgoEngine:
 
     async def _enter_position(self, instrument: Instrument, signal: dict[str, Any]) -> None:
         if self._is_symbol_locked(instrument.symbol):
-            self.event("WARN", f"{instrument.symbol} entry blocked: broker/app quantity mismatch is locked.")
+            self.event("WARN", f"{instrument.symbol} entry blocked: {self._entry_block_reason(instrument.symbol)}.")
             return
         entry = float(signal["entry_price"])
         stop, target = setup_stop(entry, signal["stop_candle"], self.settings)
@@ -1025,7 +1025,7 @@ class DhanAlgoEngine:
 
     async def _enter_scalper_position(self, instrument: Instrument, side: str, entry: float, reason: str) -> bool:
         if self._is_symbol_locked(instrument.symbol):
-            self.event("WARN", f"{instrument.symbol} scalper {side.lower()} blocked: broker/app quantity mismatch is locked.")
+            self.event("WARN", f"{instrument.symbol} scalper {side.lower()} blocked: {self._entry_block_reason(instrument.symbol)}.")
             return False
         stop, target = self._scalper_stop_target(entry, side)
         quantity, sizing_reason = calculate_quantity(entry, stop, self.settings, side)
@@ -1189,6 +1189,9 @@ class DhanAlgoEngine:
 
     async def _maybe_pyramid_scalper(self, position: Position, instrument: Instrument, price: float) -> None:
         if not self.settings.scalper_pyramiding:
+            return
+        if self._is_symbol_locked(position.symbol):
+            self.event("WARN", f"{position.symbol} scalper pyramid blocked: {self._entry_block_reason(position.symbol)}.")
             return
         max_adds = max(0, int(self.settings.scalper_max_adds or 0))
         add_count = int(position.meta.get("pyramid_adds") or 0)
@@ -1524,9 +1527,22 @@ class DhanAlgoEngine:
     async def _broker_reconcile_worker(self) -> None:
         while self.running:
             try:
-                await self.reconcile_broker_state()
+                await asyncio.wait_for(
+                    self.reconcile_broker_state(),
+                    timeout=STARTUP_BROKER_RECONCILE_TIMEOUT_SECONDS,
+                )
             except asyncio.CancelledError:
                 break
+            except asyncio.TimeoutError:
+                self.entries_blocked_until_reconcile = True
+                self.broker_reconcile_status = {
+                    **self.broker_reconcile_status,
+                    "running": False,
+                    "message": f"Broker reconcile timed out after {STARTUP_BROKER_RECONCILE_TIMEOUT_SECONDS:g}s; new entries are blocked until broker reconcile succeeds.",
+                    "last_run": datetime.now(IST).isoformat(),
+                    "entries_blocked_until_reconcile": True,
+                }
+                self.event("WARN", self.broker_reconcile_status["message"])
             except DhanAuthenticationError as exc:
                 self._handle_auth_failure("Broker reconciliation", exc)
                 break
@@ -1539,13 +1555,16 @@ class DhanAlgoEngine:
                     "running": False,
                     "message": f"Broker reconcile failed: {exc}",
                     "last_run": datetime.now(IST).isoformat(),
+                    "entries_blocked_until_reconcile": True,
                 }
+                self.entries_blocked_until_reconcile = True
                 self.event("WARN", self.broker_reconcile_status["message"])
             await asyncio.sleep(20)
 
     async def reconcile_broker_state(self, startup: bool = False) -> dict[str, Any]:
         if self.settings.dry_run:
             self.locked_symbols = set()
+            self.entries_blocked_until_reconcile = False
             self.broker_reconcile_status = {
                 "running": False,
                 "message": "Dry run: broker reconciliation skipped",
@@ -1554,6 +1573,7 @@ class DhanAlgoEngine:
                 "pending_orders": [],
                 "failed_orders": [],
                 "locked_symbols": [],
+                "entries_blocked_until_reconcile": False,
             }
             return self.broker_reconcile_status
         if not self.client:
@@ -1586,6 +1606,7 @@ class DhanAlgoEngine:
                     }
                 )
         pending_orders, failed_orders = self._relevant_order_lists(order_book)
+        self.entries_blocked_until_reconcile = False
         new_locked = {
             row["symbol"]
             for row in mismatches
@@ -1615,6 +1636,7 @@ class DhanAlgoEngine:
             "pending_orders": pending_orders,
             "failed_orders": failed_orders,
             "locked_symbols": sorted(self.locked_symbols),
+            "entries_blocked_until_reconcile": self.entries_blocked_until_reconcile,
         }
         return self.broker_reconcile_status
 
@@ -2266,6 +2288,7 @@ class DhanAlgoEngine:
                 "reconcile": self.reconcile_status,
                 "broker_reconcile": self.broker_reconcile_status,
                 "locked_symbols": sorted(self.locked_symbols),
+                "entries_blocked_until_reconcile": self.entries_blocked_until_reconcile,
                 "ledger_file": str(TRADE_LEDGER_FILE),
             }
 
