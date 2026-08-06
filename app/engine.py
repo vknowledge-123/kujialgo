@@ -19,6 +19,8 @@ from .config import (
     PREMARKET_FILE,
     PREMARKET_REPORT_FILE,
     STATE_FILE,
+    TICK_QUEUE_MAXSIZE,
+    TICK_QUEUE_WARN_INTERVAL_SECONDS,
     TRADE_LEDGER_FILE,
 )
 from .dhan_api import DhanAuthenticationError, DhanClient
@@ -259,6 +261,8 @@ class DhanAlgoEngine:
         self.feed_generation = 0
         self.loop: asyncio.AbstractEventLoop | None = None
         self.tick_queue: asyncio.Queue[tuple[str, str, float, int | None, datetime]] | None = None
+        self.dropped_ticks = 0
+        self.last_tick_queue_warn_ts = 0.0
         self.feed_threads: list[threading.Thread] = []
         self.feed_sockets: list[Any] = []
         self.order_task: asyncio.Task | None = None
@@ -266,6 +270,8 @@ class DhanAlgoEngine:
         self.cache_task: asyncio.Task | None = None
         self.reconcile_task: asyncio.Task | None = None
         self.broker_reconcile_task: asyncio.Task | None = None
+        self.action_tasks: set[asyncio.Task] = set()
+        self.pending_actions: set[str] = set()
         self.credentials: dict[str, str] = {}
         self.long_symbols: list[str] = []
         self.short_symbols: list[str] = []
@@ -459,6 +465,77 @@ class DhanAlgoEngine:
     def _is_symbol_locked(self, symbol: str) -> bool:
         return symbol in self.locked_symbols
 
+    def _extract_error_message(self, payload: Any) -> str:
+        if payload is None:
+            return ""
+        if isinstance(payload, str):
+            return payload[:800]
+        if isinstance(payload, dict):
+            nested = payload.get("data") if isinstance(payload.get("data"), dict) else None
+            candidates = [
+                payload.get("errorMessage"),
+                payload.get("error_message"),
+                payload.get("message"),
+                payload.get("remarks"),
+                payload.get("rejectReason"),
+                payload.get("rejectionReason"),
+                payload.get("reason"),
+                payload.get("error"),
+            ]
+            if nested:
+                candidates.extend(
+                    [
+                        nested.get("errorMessage"),
+                        nested.get("message"),
+                        nested.get("remarks"),
+                        nested.get("rejectReason"),
+                        nested.get("rejectionReason"),
+                        nested.get("reason"),
+                    ]
+                )
+            text = next((str(item) for item in candidates if item not in (None, "")), "")
+            code = str(payload.get("errorCode") or (nested or {}).get("errorCode") or "")
+            error_type = str(payload.get("errorType") or (nested or {}).get("errorType") or "")
+            parts = [item for item in (code, error_type, text) if item]
+            if parts:
+                return " | ".join(parts)[:800]
+            try:
+                return json.dumps(payload, ensure_ascii=True)[:800]
+            except TypeError:
+                return str(payload)[:800]
+        return str(payload)[:800]
+
+    def _order_failure_reason(self, order: dict[str, Any]) -> str:
+        return (
+            str(order.get("error_message") or "")
+            or self._extract_error_message(order.get("raw_detail"))
+            or self._extract_error_message(order.get("raw"))
+        )
+
+    def _schedule_action(self, key: str, factory: Any) -> bool:
+        if key in self.pending_actions:
+            return False
+        self.pending_actions.add(key)
+        task = asyncio.create_task(self._run_scheduled_action(key, factory))
+        self.action_tasks.add(task)
+        task.add_done_callback(self.action_tasks.discard)
+        return True
+
+    async def _run_scheduled_action(self, key: str, factory: Any) -> None:
+        try:
+            await factory()
+        except asyncio.CancelledError:
+            raise
+        except DhanAuthenticationError as exc:
+            self._handle_auth_failure("Order action", exc)
+        except Exception as exc:
+            if _is_auth_error(exc):
+                self._handle_auth_failure("Order action", exc)
+                return
+            self.event("ERROR", f"Order action failed: {exc}")
+        finally:
+            self.pending_actions.discard(key)
+
     def _handle_auth_failure(self, source: str, exc: Exception) -> None:
         self.last_error = f"{source}: Dhan credentials invalid or expired. Update client ID/access token and restart algo."
         self.event("ERROR", self.last_error)
@@ -478,7 +555,7 @@ class DhanAlgoEngine:
             current = asyncio.current_task()
         except RuntimeError:
             current = None
-        for task in (self.tick_task, self.order_task, self.reconcile_task, self.broker_reconcile_task):
+        for task in (self.tick_task, self.order_task, self.reconcile_task, self.broker_reconcile_task, *list(self.action_tasks)):
             if task and task is not current and not task.done():
                 task.cancel()
 
@@ -536,7 +613,7 @@ class DhanAlgoEngine:
             self.event("INFO", "Algo is already running.")
             return self.snapshot()
         self.loop = asyncio.get_running_loop()
-        self.tick_queue = asyncio.Queue(maxsize=20000)
+        self.tick_queue = asyncio.Queue(maxsize=TICK_QUEUE_MAXSIZE)
         if not self.client:
             if self.credentials.get("client_id") and self.credentials.get("access_token"):
                 self.client = DhanClient(self.credentials["client_id"], self.credentials["access_token"])
@@ -567,7 +644,7 @@ class DhanAlgoEngine:
         self.market_connected = False
         self.order_connected = False
         self._close_market_feed_sockets()
-        for task in (self.tick_task, self.order_task, self.reconcile_task, self.broker_reconcile_task):
+        for task in (self.tick_task, self.order_task, self.reconcile_task, self.broker_reconcile_task, *list(self.action_tasks)):
             if task:
                 task.cancel()
         self.event("INFO", "Algo stopped.")
@@ -683,10 +760,25 @@ class DhanAlgoEngine:
     def _enqueue_tick(self, segment: str, security_id: str, price: float, volume: int | None, timestamp: datetime) -> None:
         if not self.tick_queue:
             return
+        item = (segment, security_id, price, volume, timestamp)
         try:
-            self.tick_queue.put_nowait((segment, security_id, price, volume, timestamp))
+            self.tick_queue.put_nowait(item)
         except asyncio.QueueFull:
-            self.event("WARN", "Tick queue is full; dropping latest tick.")
+            self.dropped_ticks += 1
+            try:
+                self.tick_queue.get_nowait()
+                self.tick_queue.put_nowait(item)
+            except asyncio.QueueFull:
+                pass
+            except asyncio.QueueEmpty:
+                pass
+            now = time.monotonic()
+            if now - self.last_tick_queue_warn_ts >= TICK_QUEUE_WARN_INTERVAL_SECONDS:
+                self.last_tick_queue_warn_ts = now
+                self.event(
+                    "WARN",
+                    f"Tick queue pressure: dropped oldest ticks {self.dropped_ticks}, queue size {self.tick_queue.qsize()}/{self.tick_queue.maxsize}.",
+                )
 
     async def _tick_worker(self) -> None:
         assert self.tick_queue is not None
@@ -709,7 +801,7 @@ class DhanAlgoEngine:
         for position in self._open_positions_for_symbol(symbol):
             position.last_price = price
             if position.strategy in {"scalper_long", "scalper_short"}:
-                await self._manage_scalper_position(position, instrument, price)
+                self._schedule_scalper_management(position, instrument, price)
         await self._evaluate_scalper_tick(instrument, price, timestamp)
         if self._is_symbol_locked(symbol):
             return
@@ -720,7 +812,10 @@ class DhanAlgoEngine:
         candles = self.candles.all_candles(symbol, self.settings.timeframe)
         signal = self.long_evaluator.evaluate_tick_entry(symbol, price, candles, self.settings)
         if signal:
-            await self._enter_position(instrument, signal)
+            self._schedule_action(
+                f"ENTRY:{instrument.symbol}:LONG",
+                lambda instrument=instrument, signal=signal: self._enter_position(instrument, signal),
+            )
 
     async def _evaluate_closed_candle(self, instrument: Instrument, candle: Candle) -> None:
         if candle.timeframe != self.settings.timeframe:
@@ -733,7 +828,10 @@ class DhanAlgoEngine:
                     continue
                 reason = self.long_evaluator.evaluate_exit(position, candles, self.settings)
                 if reason:
-                    await self._exit_position(position, reason)
+                    self._schedule_action(
+                        f"EXIT:{position.symbol}:{position.side}",
+                        lambda position=position, reason=reason: self._exit_position(position, reason),
+                    )
         if symbol not in self.long_symbols or self._has_open_position(symbol):
             return
         if self._is_symbol_locked(symbol):
@@ -743,7 +841,10 @@ class DhanAlgoEngine:
         for event in self.long_evaluator.on_closed_candle(symbol, candles, previous_day, baseline, self.settings):
             self.event(event.get("type", "INFO"), f"{symbol} {event.get('strategy')}: {event.get('reason')}")
             if event.get("type") == "ENTRY" and self._passes_sector_filter(symbol, "long"):
-                await self._enter_position(instrument, event)
+                self._schedule_action(
+                    f"ENTRY:{instrument.symbol}:LONG",
+                    lambda instrument=instrument, event=event: self._enter_position(instrument, event),
+                )
 
     async def _enter_position(self, instrument: Instrument, signal: dict[str, Any]) -> None:
         if self._is_symbol_locked(instrument.symbol):
@@ -780,7 +881,9 @@ class DhanAlgoEngine:
         )
         status = order.get("status", "")
         if str(status).upper() not in TRADED_STATUSES:
-            self.event("ERROR", f"{instrument.symbol} entry not opened because order status is {status or 'UNKNOWN'}.")
+            reason = self._order_failure_reason(order)
+            suffix = f": {reason}" if reason else "."
+            self.event("ERROR", f"{instrument.symbol} entry not opened because order status is {status or 'UNKNOWN'}{suffix}")
             return
         executed_quantity = int(order.get("traded_quantity") or quantity)
         if executed_quantity < 1:
@@ -819,13 +922,19 @@ class DhanAlgoEngine:
             return
         if want_long and not state.get("long_triggered"):
             if self._passes_sector_filter(instrument.symbol, "long") and price > float(state.get("high") or 0):
-                if await self._enter_scalper_position(instrument, "LONG", price, "Break above scalper reference high"):
-                    state["long_triggered"] = True
+                state["long_triggered"] = True
+                self._schedule_action(
+                    f"ENTRY:{instrument.symbol}:LONG",
+                    lambda instrument=instrument, price=price: self._enter_scalper_position(instrument, "LONG", price, "Break above scalper reference high"),
+                )
                 return
         if want_short and not state.get("short_triggered"):
             if self._passes_sector_filter(instrument.symbol, "short") and price < float(state.get("low") or 0):
-                if await self._enter_scalper_position(instrument, "SHORT", price, "Break below scalper reference low"):
-                    state["short_triggered"] = True
+                state["short_triggered"] = True
+                self._schedule_action(
+                    f"ENTRY:{instrument.symbol}:SHORT",
+                    lambda instrument=instrument, price=price: self._enter_scalper_position(instrument, "SHORT", price, "Break below scalper reference low"),
+                )
 
     def _scalper_reference_state(self, symbol: str, price: float, timestamp: datetime) -> dict[str, Any]:
         timestamp = to_ist(timestamp)
@@ -921,7 +1030,9 @@ class DhanAlgoEngine:
         )
         status = str(order.get("status") or "").upper()
         if status not in TRADED_STATUSES:
-            self.event("ERROR", f"{instrument.symbol} scalper {side.lower()} not opened because order status is {status or 'UNKNOWN'}.")
+            reason = self._order_failure_reason(order)
+            suffix = f": {reason}" if reason else "."
+            self.event("ERROR", f"{instrument.symbol} scalper {side.lower()} not opened because order status is {status or 'UNKNOWN'}{suffix}")
             return False
         executed_quantity = int(order.get("traded_quantity") or quantity)
         if executed_quantity < 1:
@@ -981,6 +1092,23 @@ class DhanAlgoEngine:
         self._trail_scalper_to_breakeven(position, price)
         await self._maybe_pyramid_scalper(position, instrument, price)
 
+    def _schedule_scalper_management(self, position: Position, instrument: Instrument, price: float) -> None:
+        if position.status != "OPEN":
+            return
+        reason = self._scalper_exit_reason(position, price)
+        if reason:
+            self._schedule_action(
+                f"EXIT:{position.symbol}:{position.side}",
+                lambda position=position, reason=reason: self._exit_position(position, reason),
+            )
+            return
+        self._trail_scalper_to_breakeven(position, price)
+        if self._scalper_pyramid_due(position, price):
+            self._schedule_action(
+                f"PYRAMID:{position.symbol}:{position.side}",
+                lambda position=position, instrument=instrument, price=price: self._maybe_pyramid_scalper(position, instrument, price),
+            )
+
     def _scalper_exit_reason(self, position: Position, price: float) -> str:
         if position.side == "SHORT":
             if price >= position.stop_loss:
@@ -993,6 +1121,20 @@ class DhanAlgoEngine:
         if price >= position.target:
             return "TARGET"
         return ""
+
+    def _scalper_pyramid_due(self, position: Position, price: float) -> bool:
+        if not self.settings.scalper_pyramiding:
+            return False
+        max_adds = max(0, int(self.settings.scalper_max_adds or 0))
+        add_count = int(position.meta.get("pyramid_adds") or 0)
+        initial_entry = float(position.meta.get("initial_entry") or position.entry_price)
+        sl_percent = max(0.1, float(position.meta.get("sl_percent") or self.settings.scalper_sl_percent or 0.8))
+        if add_count >= max_adds or initial_entry <= 0:
+            return False
+        next_add = add_count + 1
+        if position.side == "SHORT":
+            return price <= initial_entry * (1 - (sl_percent / 100) * next_add)
+        return price >= initial_entry * (1 + (sl_percent / 100) * next_add)
 
     def _trail_scalper_to_breakeven(self, position: Position, price: float) -> None:
         if position.meta.get("breakeven_moved"):
@@ -1050,7 +1192,9 @@ class DhanAlgoEngine:
             )
             status = str(order.get("status") or "").upper()
             if status not in TRADED_STATUSES:
-                self.event("ERROR", f"{position.symbol} scalper pyramid add {next_add} failed with status {status or 'UNKNOWN'}; algo quantity unchanged.")
+                reason = self._order_failure_reason(order)
+                suffix = f": {reason}" if reason else ""
+                self.event("ERROR", f"{position.symbol} scalper pyramid add {next_add} failed with status {status or 'UNKNOWN'}{suffix}; algo quantity unchanged.")
                 return
             executed_quantity = int(order.get("traded_quantity") or initial_quantity)
             if executed_quantity < 1:
@@ -1101,7 +1245,9 @@ class DhanAlgoEngine:
         )
         status = str(order.get("status") or "").upper()
         if status not in TRADED_STATUSES:
-            self.event("ERROR", f"{position.symbol} exit {reason} not marked closed because order status is {status or 'UNKNOWN'}.")
+            failure = self._order_failure_reason(order)
+            suffix = f": {failure}" if failure else "."
+            self.event("ERROR", f"{position.symbol} exit {reason} not marked closed because order status is {status or 'UNKNOWN'}{suffix}")
             return
         executed_quantity = int(order.get("traded_quantity") or position.quantity)
         if executed_quantity < position.quantity:
@@ -1188,6 +1334,7 @@ class DhanAlgoEngine:
                     "correlation_id": attempt_correlation_id,
                     "average_price": 0.0,
                     "traded_quantity": 0,
+                    "error_message": str(exc)[:800],
                 }
                 self._update_ledger_order(attempt_correlation_id, {"status": "PLACE_FAILED", "raw": last_result["raw"]})
                 if isinstance(exc, DhanAuthenticationError) or _is_auth_error(exc):
@@ -1210,12 +1357,19 @@ class DhanAlgoEngine:
             last_result["status"] = final_status
             details = await self._order_fill_details(order_id, reference_price if final_status in TRADED_STATUSES else 0)
             last_result.update(details)
+            if final_status not in TRADED_STATUSES:
+                detail = await self._order_detail(order_id)
+                if detail:
+                    last_result["raw_detail"] = detail
+                    last_result["error_message"] = self._extract_error_message(detail)
+                    self._update_ledger_order(attempt_correlation_id, {"raw_detail": detail, "error_message": last_result["error_message"]})
             self._update_ledger_order(
                 attempt_correlation_id,
                 {
                     "status": final_status,
                     "average_price": details.get("average_price") or None,
                     "traded_quantity": details.get("traded_quantity") or None,
+                    "error_message": last_result.get("error_message") or None,
                 },
             )
             if final_status in TRADED_STATUSES:
@@ -1227,8 +1381,20 @@ class DhanAlgoEngine:
                 except Exception as exc:
                     self.event("WARN", f"Cancel before retry failed for {instrument.symbol}: {exc}")
             await asyncio.sleep(0.25 * attempt)
-        self.event("ERROR", f"{instrument.symbol} {transaction_type} failed after 3 attempts: {last_result.get('status')}")
+        reason = self._order_failure_reason(last_result)
+        suffix = f": {reason}" if reason else ""
+        self.event("ERROR", f"{instrument.symbol} {transaction_type} failed after 3 attempts: {last_result.get('status')}{suffix}")
         return last_result
+
+    async def _order_detail(self, order_id: str) -> dict[str, Any]:
+        if not order_id or order_id.startswith("DRY-"):
+            return {}
+        try:
+            assert self.client is not None
+            data = await self.client.order_by_id(order_id)
+            return data if isinstance(data, dict) else {}
+        except Exception as exc:
+            return {"error": str(exc)[:500]}
 
     async def _order_fill_details(self, order_id: str, fallback_price: float = 0.0) -> dict[str, Any]:
         if not order_id or order_id.startswith("DRY-"):
@@ -2049,6 +2215,10 @@ class DhanAlgoEngine:
                 "order_reconnects": self.order_reconnects,
                 "last_error": self.last_error,
                 "last_tick_age_seconds": round(time.time() - self.last_tick_ts, 1) if self.last_tick_ts else None,
+                "tick_queue_size": self.tick_queue.qsize() if self.tick_queue else 0,
+                "tick_queue_maxsize": self.tick_queue.maxsize if self.tick_queue else TICK_QUEUE_MAXSIZE,
+                "dropped_ticks": self.dropped_ticks,
+                "pending_actions": sorted(self.pending_actions),
                 "settings": self.settings.__dict__,
                 "credentials_present": bool(self.credentials.get("client_id") and self.credentials.get("access_token")),
                 "credential_client_id": self.credentials.get("client_id") or "",

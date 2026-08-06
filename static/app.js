@@ -148,7 +148,18 @@ function render(data) {
   if (data.order_last_error && !data.order_connected) events.unshift({ kind: "INFO", time: new Date().toISOString(), message: data.order_last_error });
   if (data.premarket?.message) events.unshift({ kind: "INFO", time: new Date().toISOString(), message: `Premarket: ${data.premarket.message} (${data.premarket.progress || 0}%)` });
   if (data.reconcile?.message) events.unshift({ kind: "INFO", time: data.reconcile.last_run || new Date().toISOString(), message: `Reconcile: ${data.reconcile.message}` });
-  if (data.broker_reconcile?.message) events.unshift({ kind: data.broker_reconcile.locked_symbols?.length ? "ERROR" : "INFO", time: data.broker_reconcile.last_run || new Date().toISOString(), message: `Broker: ${data.broker_reconcile.message}` });
+  if (data.broker_reconcile?.message) {
+    const brokerProblem = !data.broker_reconcile.running && (
+      (data.broker_reconcile.locked_symbols || []).length
+      || (data.broker_reconcile.mismatches || []).length
+      || (data.broker_reconcile.pending_orders || []).length
+    );
+    events.unshift({
+      kind: brokerProblem ? "ERROR" : "INFO",
+      time: data.broker_reconcile.last_run || new Date().toISOString(),
+      message: `Broker: ${data.broker_reconcile.message}`,
+    });
+  }
   $("events").innerHTML = events.slice(0, 40).map((e) => `
     <div class="event ${e.kind}">
       <time>${formatTime(e.time)} - ${e.kind}</time>
