@@ -60,9 +60,19 @@ async function api(path, options = {}) {
     headers: { "Content-Type": "application/json" },
     ...options,
   });
-  const data = await res.json();
+  const text = await res.text();
+  let data = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch (_err) {
+    data = { detail: text || res.statusText || "Request failed" };
+  }
   if (!res.ok) throw new Error(data.detail || "Request failed");
   return data;
+}
+
+function td(value) {
+  return `<td>${escapeHtml(value ?? "-")}</td>`;
 }
 
 async function saveConfig() {
@@ -124,22 +134,22 @@ function render(data) {
 
   $("positions").innerHTML = (data.positions || []).map((p) => `
     <tr>
-      <td>${p.symbol}</td><td>${p.side}</td><td>${p.strategy}</td>
-      <td>${p.quantity || "-"}</td><td>${money(p.entry_price)}</td><td>${money(p.stop_loss)}</td><td>${money(p.target)}</td><td>${p.status}</td>
+      ${td(p.symbol)}${td(p.side)}${td(p.strategy)}
+      ${td(p.quantity || "-")}${td(money(p.entry_price))}${td(money(p.stop_loss))}${td(money(p.target))}${td(p.status)}
     </tr>
   `).join("") || `<tr><td colspan="8">No trades yet</td></tr>`;
 
   $("instruments").innerHTML = (data.latest || []).map((r) => `
     <tr>
-      <td>${r.symbol}</td><td>${r.security_id}</td><td>${r.sector || "-"}</td>
-      <td>${money(r.price)}</td><td>${r.candles_1m}</td><td>${r.candles_5m}</td><td>${r.locked ? "LOCKED" : "-"}</td>
+      ${td(r.symbol)}${td(r.security_id)}${td(r.sector || "-")}
+      ${td(money(r.price))}${td(r.candles_1m)}${td(r.candles_5m)}${td(r.locked ? "LOCKED" : "-")}
     </tr>
   `).join("") || `<tr><td colspan="7">No resolved instruments yet</td></tr>`;
 
   $("sectors").innerHTML = (data.sectors || []).map((r) => `
     <tr>
-      <td>${r.sector}</td><td>${r.security_id}</td>
-      <td>${money(r.price)}</td><td>${money(r.previous_close)}</td><td>${percent(r.change)}</td>
+      ${td(r.sector)}${td(r.security_id)}
+      ${td(money(r.price))}${td(money(r.previous_close))}${td(percent(r.change))}
     </tr>
   `).join("") || `<tr><td colspan="5">Sector index cache not ready</td></tr>`;
 
@@ -150,6 +160,7 @@ function render(data) {
   if (data.reconcile?.message) events.unshift({ kind: "INFO", time: data.reconcile.last_run || new Date().toISOString(), message: `Reconcile: ${data.reconcile.message}` });
   if (data.broker_reconcile?.message) {
     const brokerProblem = !data.broker_reconcile.running && (
+      data.broker_reconcile.entries_blocked_until_reconcile ||
       (data.broker_reconcile.locked_symbols || []).length
       || (data.broker_reconcile.mismatches || []).length
       || (data.broker_reconcile.pending_orders || []).length
@@ -213,7 +224,8 @@ function renderBrokerAlert(status) {
   const locked = status.locked_symbols || [];
   const mismatches = status.mismatches || [];
   const pending = status.pending_orders || [];
-  if (!locked.length && !mismatches.length && !pending.length) {
+  const entriesBlocked = Boolean(status.entries_blocked_until_reconcile);
+  if (!entriesBlocked && !locked.length && !mismatches.length && !pending.length) {
     alert.classList.add("hidden");
     alert.innerHTML = "";
     return;
@@ -221,9 +233,11 @@ function renderBrokerAlert(status) {
   alert.classList.remove("hidden");
   const mismatchText = mismatches.map((row) => `${row.symbol}: app ${row.app_qty}, broker ${row.broker_qty}`).join(" | ");
   const pendingText = pending.map((row) => `${row.symbol}: ${row.status} ${row.quantity}`).join(" | ");
+  const blockedFor = locked.length ? locked.join(", ") : "all new entries";
   alert.innerHTML = `
     <strong>Broker/app reconciliation lock active</strong>
-    <div>New entries are blocked for: ${escapeHtml(locked.join(", "))}</div>
+    <div>${escapeHtml(status.message || "New entries are blocked until broker reconcile succeeds.")}</div>
+    <div>New entries are blocked for: ${escapeHtml(blockedFor)}</div>
     ${mismatchText ? `<div>Mismatches: ${escapeHtml(mismatchText)}</div>` : ""}
     ${pendingText ? `<div>Pending orders: ${escapeHtml(pendingText)}</div>` : ""}
   `;
