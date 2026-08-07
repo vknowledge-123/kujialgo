@@ -124,6 +124,7 @@ async function refreshPremarketReport() {
 
 function render(data) {
   state.applyingRemote = true;
+  try {
   $("runState").textContent = data.running ? "Running" : "Stopped";
   $("runState").className = data.running ? "pill" : "pill bad";
   $("feedState").textContent = data.market_connected ? "Feed Live" : "Feed Off";
@@ -172,8 +173,8 @@ function render(data) {
     });
   }
   $("events").innerHTML = events.slice(0, 40).map((e) => `
-    <div class="event ${e.kind}">
-      <time>${formatTime(e.time)} - ${e.kind}</time>
+    <div class="event ${eventKindClass(e.kind)}">
+      <time>${formatTime(e.time)} - ${escapeHtml(e.kind || "")}</time>
       <div>${escapeHtml(e.message || "")}</div>
     </div>
   `).join("");
@@ -216,7 +217,9 @@ function render(data) {
   if (!state.listsDirty && document.activeElement !== $("shortText") && !$("shortText").value && (data.short_symbols || []).length) {
     $("shortText").value = data.short_symbols.join("\n");
   }
-  state.applyingRemote = false;
+  } finally {
+    state.applyingRemote = false;
+  }
 }
 
 function renderBrokerAlert(status) {
@@ -281,7 +284,7 @@ function renderCacheReport(source) {
     : "";
   const message = report.message || runningMessage || generated || idleMessage;
   $("cacheReportStatus").textContent = message || "Report not loaded";
-  const reportFile = source?.report_file || "data/premarket_cache_report.json";
+  const reportFile = report.cache_file || source?.report_file || "data/premarket_cache_report.json";
   $("cacheReportFile").textContent = report.cache_file || source?.report_file ? `Report file: ${reportFile}` : "";
 }
 
@@ -331,6 +334,11 @@ function formatTime(value) {
 
 function escapeHtml(value) {
   return String(value).replace(/[&<>"']/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#039;" }[ch]));
+}
+
+function eventKindClass(value) {
+  const kind = String(value || "").toUpperCase();
+  return ["INFO", "WARN", "ERROR", "ENTRY", "EXIT", "ARMED"].includes(kind) ? kind : "INFO";
 }
 
 document.querySelectorAll(".tf").forEach((button) => {
