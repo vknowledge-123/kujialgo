@@ -45,7 +45,7 @@ from .symbols import (
 
 EXCHANGE_SEGMENT_CODES = {0: "IDX_I", 1: "NSE_EQ", 4: "BSE_EQ"}
 TRADED_STATUSES = {"TRADED", "COMPLETED"}
-PARTIAL_FILL_STATUSES = {"PARTIAL", "PARTIALLY_FILLED", "PARTIALLY_TRADED"}
+PARTIAL_FILL_STATUSES = {"PARTIAL", "PART_TRADED", "PARTIALLY_FILLED", "PARTIALLY_TRADED"}
 FILL_ACCEPTED_STATUSES = TRADED_STATUSES | PARTIAL_FILL_STATUSES
 FAILED_STATUSES = {"REJECTED", "CANCELLED", "EXPIRED", "FAILED", "PLACE_FAILED", "STALE_UNRESOLVED"}
 PENDING_STATUSES = {"TRANSIT", "PENDING"}
@@ -112,6 +112,22 @@ def _broker_price(row: dict[str, Any], *keys: str) -> float:
             except (TypeError, ValueError):
                 continue
     return 0.0
+
+
+def _broker_filled_quantity(row: dict[str, Any]) -> int:
+    row = row.get("data", row) if isinstance(row.get("data"), dict) else row
+    filled = _broker_quantity(row, "filledQty", "filledQuantity", "tradedQuantity", "tradedQty")
+    if filled > 0:
+        return filled
+    requested = _broker_quantity(row, "quantity", "orderQuantity")
+    remaining = _broker_quantity(row, "remainingQuantity", "remainingQty", "pendingQuantity")
+    if requested > 0 and remaining >= 0 and requested >= remaining:
+        return requested - remaining
+    status = _broker_order_status(row)
+    average = _broker_price(row, "averageTradedPrice", "averagePrice", "tradedPrice")
+    if status in TRADED_STATUSES and requested > 0 and average > 0:
+        return requested
+    return 0
 
 
 def _json_objects_from_message(message: str | bytes) -> list[Any]:
@@ -302,6 +318,7 @@ class DhanAlgoEngine:
         self.order_updates: dict[str, dict[str, Any]] = {}
         self.positions: dict[str, Position] = {}
         self.scalper_state: dict[str, dict[str, Any]] = {}
+        self.reconciled_day_history: set[str] = set()
         self.ledger: dict[str, Any] = _empty_ledger()
         self.locked_symbols: set[str] = set()
         self.entries_blocked_until_reconcile = False
@@ -464,7 +481,7 @@ class DhanAlgoEngine:
             return ""
         status = _broker_order_status(row)
         average_price = self._average_price_from_order(row)
-        traded_quantity = _broker_quantity(row, "filledQty", "tradedQuantity", "tradedQty", "quantity")
+        traded_quantity = _broker_filled_quantity(row)
         requested_quantity = 0
         if correlation_id:
             requested_quantity = int(((self.ledger.get("orders") or {}).get(correlation_id) or {}).get("quantity") or 0)
@@ -519,6 +536,8 @@ class DhanAlgoEngine:
                 payload.get("remarks"),
                 payload.get("rejectReason"),
                 payload.get("rejectionReason"),
+                payload.get("omsErrorDescription"),
+                payload.get("omsErrorCode"),
                 payload.get("reason"),
                 payload.get("error"),
             ]
@@ -530,6 +549,8 @@ class DhanAlgoEngine:
                         nested.get("remarks"),
                         nested.get("rejectReason"),
                         nested.get("rejectionReason"),
+                        nested.get("omsErrorDescription"),
+                        nested.get("omsErrorCode"),
                         nested.get("reason"),
                     ]
                 )
@@ -712,6 +733,7 @@ class DhanAlgoEngine:
             self.event("INFO", self.broker_reconcile_status["message"])
         self.running = True
         self.scalper_state = {}
+        self.reconciled_day_history = set()
         self.feed_generation += 1
         self.tick_task = asyncio.create_task(self._tick_worker())
         self.execution_tasks = {asyncio.create_task(self._execution_worker()) for _ in range(max(1, EXECUTION_WORKER_COUNT))}
@@ -945,6 +967,9 @@ class DhanAlgoEngine:
         if self._is_symbol_locked(instrument.symbol):
             self.event("WARN", f"{instrument.symbol} entry blocked: {self._entry_block_reason(instrument.symbol)}.")
             return
+        if self._has_open_position(instrument.symbol):
+            self.event("WARN", f"{instrument.symbol} entry skipped: an app position is already open.")
+            return
         entry = float(signal["entry_price"])
         stop, target = setup_stop(entry, signal["stop_candle"], self.settings)
         quantity, sizing_reason = calculate_quantity(entry, stop, self.settings, "LONG")
@@ -1017,21 +1042,23 @@ class DhanAlgoEngine:
             return
         if want_long and not state.get("long_triggered"):
             if self._passes_sector_filter(instrument.symbol, "long") and price > float(state.get("high") or 0):
-                state["long_triggered"] = True
-                self._schedule_action(
+                scheduled = self._schedule_action(
                     f"ENTRY:{instrument.symbol}:LONG",
                     lambda instrument=instrument, price=price: self._enter_scalper_position(instrument, "LONG", price, "Break above scalper reference high"),
                     priority=50,
                 )
-                return
+                if scheduled:
+                    state["long_triggered"] = True
+                    return
         if want_short and not state.get("short_triggered"):
             if self._passes_sector_filter(instrument.symbol, "short") and price < float(state.get("low") or 0):
-                state["short_triggered"] = True
-                self._schedule_action(
+                scheduled = self._schedule_action(
                     f"ENTRY:{instrument.symbol}:SHORT",
                     lambda instrument=instrument, price=price: self._enter_scalper_position(instrument, "SHORT", price, "Break below scalper reference low"),
                     priority=50,
                 )
+                if scheduled:
+                    state["short_triggered"] = True
 
     def _scalper_reference_state(self, symbol: str, price: float, timestamp: datetime) -> dict[str, Any]:
         timestamp = to_ist(timestamp)
@@ -1066,6 +1093,11 @@ class DhanAlgoEngine:
             high = float(state.get("high") or 0)
             low = float(state.get("low") or 0)
             if high <= 0 or low <= 0:
+                if not self._has_opening_history(symbol, timestamp):
+                    if state.get("mode") != "awaiting_day_history":
+                        self.event("INFO", f"{symbol} scalper waiting for reconciled day-high/day-low history.")
+                    state["mode"] = "awaiting_day_history"
+                    return state
                 high, low = self._day_extremes_until(symbol, price, timestamp)
                 state["mode"] = "late_day_reference"
             state["high"] = high
@@ -1074,6 +1106,25 @@ class DhanAlgoEngine:
             state["ready_at"] = timestamp.isoformat()
             return state
         return state
+
+    def _has_opening_history(self, symbol: str, timestamp: datetime) -> bool:
+        return symbol in self.reconciled_day_history
+
+    def _mark_reconciled_day_history(self, instrument: Instrument, rows: list[dict[str, Any]], as_of: datetime | None = None) -> None:
+        if not rows:
+            return
+        now = as_of or datetime.now(IST)
+        session_open_dt = now.replace(
+            hour=SESSION_OPEN.hour,
+            minute=SESSION_OPEN.minute,
+            second=0,
+            microsecond=0,
+        )
+        for row in rows:
+            timestamp = row.get("timestamp")
+            if timestamp and to_ist(timestamp).replace(second=0, microsecond=0) == session_open_dt:
+                self.reconciled_day_history.add(instrument.symbol)
+                return
 
     def _day_extremes_until(self, symbol: str, price: float, timestamp: datetime) -> tuple[float, float]:
         session_open_dt = timestamp.replace(
@@ -1094,6 +1145,9 @@ class DhanAlgoEngine:
     async def _enter_scalper_position(self, instrument: Instrument, side: str, entry: float, reason: str) -> bool:
         if self._is_symbol_locked(instrument.symbol):
             self.event("WARN", f"{instrument.symbol} scalper {side.lower()} blocked: {self._entry_block_reason(instrument.symbol)}.")
+            return False
+        if self._has_open_position(instrument.symbol):
+            self.event("WARN", f"{instrument.symbol} scalper {side.lower()} skipped: an app position is already open.")
             return False
         stop, target = self._scalper_stop_target(entry, side)
         quantity, sizing_reason = calculate_quantity(entry, stop, self.settings, side)
@@ -1259,6 +1313,8 @@ class DhanAlgoEngine:
 
     async def _maybe_pyramid_scalper(self, position: Position, instrument: Instrument, price: float) -> None:
         if not self.settings.scalper_pyramiding:
+            return
+        if position.status != "OPEN":
             return
         if self._is_symbol_locked(position.symbol):
             self.event("WARN", f"{position.symbol} scalper pyramid blocked: {self._entry_block_reason(position.symbol)}.")
@@ -1714,7 +1770,7 @@ class DhanAlgoEngine:
                 assert self.client is not None
                 row = await self.client.order_by_id(order_id)
                 average_price = self._average_price_from_order(row)
-                traded_quantity = _broker_quantity(row, "filledQty", "tradedQuantity", "tradedQty", "quantity")
+                traded_quantity = _broker_filled_quantity(row)
             except Exception:
                 pass
         if average_price <= 0:
@@ -2176,7 +2232,9 @@ class DhanAlgoEngine:
             position_key = str(record.get("position_key") or "")
             metadata = record.get("metadata") or {}
             fill_price = float(record.get("average_price") or metadata.get("reference_price") or 0)
-            traded_quantity = int(record.get("traded_quantity") or record.get("quantity") or 0)
+            traded_quantity = int(record.get("traded_quantity") or 0)
+            if traded_quantity <= 0 and status in TRADED_STATUSES:
+                traded_quantity = int(record.get("quantity") or 0)
             applied_quantity = int(record.get("applied_quantity") or 0)
             quantity = max(0, traded_quantity - applied_quantity)
             if quantity <= 0:
@@ -2590,6 +2648,7 @@ class DhanAlgoEngine:
                 cache["errors"].pop(instrument.symbol, None)
                 self.candles.seed_history(instrument, 1, intraday_1)
                 self.candles.seed_history(instrument, 5, intraday_5)
+                self._mark_reconciled_day_history(instrument, intraday_1, now)
                 cached += 1
             except Exception as exc:
                 if isinstance(exc, DhanAuthenticationError) or _is_auth_error(exc):
@@ -2738,6 +2797,8 @@ class DhanAlgoEngine:
             if missing:
                 rows = await self.client.intraday(instrument.security_id, timeframe, min(missing), now)
                 self.candles.seed_history(instrument, timeframe, rows)
+                if timeframe == 1:
+                    self._mark_reconciled_day_history(instrument, rows, now)
             result[str(timeframe)] = len(missing)
         return result
 

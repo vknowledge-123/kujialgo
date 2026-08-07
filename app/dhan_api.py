@@ -198,8 +198,6 @@ class DhanClient:
             "price": 0.0,
             "triggerPrice": 0.0,
             "afterMarketOrder": False,
-            "boProfitValue": None,
-            "boStopLossValue": None,
         }
         try:
             return await self.post("/orders", payload, order=True)
