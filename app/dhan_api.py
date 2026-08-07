@@ -175,25 +175,37 @@ class DhanClient:
         return await self.post("/marketfeed/quote", securities)
 
     async def place_market_order(self, security_id: str, transaction_type: str, quantity: int, correlation_id: str) -> dict[str, Any]:
+        transaction_type = str(transaction_type or "").upper()
+        if transaction_type not in {"BUY", "SELL"}:
+            raise ValueError("transaction_type must be BUY or SELL")
+        security_id = str(security_id or "").strip()
+        if not security_id.isdigit():
+            raise ValueError(f"securityId must be numeric for Dhan orders, got {security_id!r}")
+        quantity = int(quantity or 0)
+        if quantity <= 0:
+            raise ValueError("quantity must be greater than zero")
         payload = {
             "dhanClientId": self.client_id,
             "correlationId": correlation_id[:30],
-            "transactionType": transaction_type.upper(),
+            "transactionType": transaction_type,
             "exchangeSegment": "NSE_EQ",
             "productType": "INTRADAY",
             "orderType": "MARKET",
             "validity": "DAY",
-            "securityId": str(security_id),
-            "quantity": int(quantity),
+            "securityId": security_id,
+            "quantity": quantity,
             "disclosedQuantity": 0,
-            "price": 0,
-            "triggerPrice": 0,
+            "price": 0.0,
+            "triggerPrice": 0.0,
             "afterMarketOrder": False,
-            "amoTime": "",
-            "boProfitValue": "",
-            "boStopLossValue": "",
+            "boProfitValue": None,
+            "boStopLossValue": None,
         }
-        return await self.post("/orders", payload, order=True)
+        try:
+            return await self.post("/orders", payload, order=True)
+        except Exception as exc:
+            setattr(exc, "request_payload", payload)
+            raise
 
     async def cancel_order(self, order_id: str) -> dict[str, Any]:
         return await self.delete(f"/orders/{order_id}", order=True)

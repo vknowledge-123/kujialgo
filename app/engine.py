@@ -1360,17 +1360,34 @@ class DhanAlgoEngine:
             try:
                 result = await self.client.place_market_order(instrument.security_id, transaction_type, quantity, attempt_correlation_id)
             except Exception as exc:
+                request_payload = getattr(exc, "request_payload", {})
+                payload_note = ""
+                if isinstance(request_payload, dict) and request_payload:
+                    payload_note = (
+                        f" | payload securityId={request_payload.get('securityId')}, "
+                        f"transactionType={request_payload.get('transactionType')}, "
+                        f"quantity={request_payload.get('quantity')}, "
+                        f"productType={request_payload.get('productType')}, "
+                        f"orderType={request_payload.get('orderType')}"
+                    )
                 last_result = {
                     "order_id": "",
                     "status": "PLACE_FAILED",
                     "attempts": attempt,
-                    "raw": {"error": str(exc)[:500]},
+                    "raw": {"error": str(exc)[:500], "request_payload": request_payload or None},
                     "correlation_id": attempt_correlation_id,
                     "average_price": 0.0,
                     "traded_quantity": 0,
-                    "error_message": str(exc)[:800],
+                    "error_message": (str(exc) + payload_note)[:1000],
                 }
-                self._update_ledger_order(attempt_correlation_id, {"status": "PLACE_FAILED", "raw": last_result["raw"]})
+                self._update_ledger_order(
+                    attempt_correlation_id,
+                    {
+                        "status": "PLACE_FAILED",
+                        "raw": last_result["raw"],
+                        "error_message": last_result["error_message"],
+                    },
+                )
                 if isinstance(exc, DhanAuthenticationError) or _is_auth_error(exc):
                     raise
                 await asyncio.sleep(0.25 * attempt)
