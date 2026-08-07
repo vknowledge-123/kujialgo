@@ -17,6 +17,7 @@ from .config import (
     BROKER_POSITIONS_TIMEOUT_SECONDS,
     BROKER_PENDING_LOOKUP_LIMIT,
     BROKER_RECONCILE_TIMEOUT_SECONDS,
+    BROKER_TRADE_BOOK_TIMEOUT_SECONDS,
     DHAN_FEED_URL,
     DHAN_ORDER_UPDATE_URL,
     MAX_INSTRUMENTS_PER_CONNECTION,
@@ -43,10 +44,12 @@ from .symbols import (
 
 EXCHANGE_SEGMENT_CODES = {0: "IDX_I", 1: "NSE_EQ", 4: "BSE_EQ"}
 TRADED_STATUSES = {"TRADED", "COMPLETED"}
+PARTIAL_FILL_STATUSES = {"PARTIAL", "PARTIALLY_FILLED", "PARTIALLY_TRADED"}
+FILL_ACCEPTED_STATUSES = TRADED_STATUSES | PARTIAL_FILL_STATUSES
 FAILED_STATUSES = {"REJECTED", "CANCELLED", "EXPIRED", "FAILED", "PLACE_FAILED", "STALE_UNRESOLVED"}
 PENDING_STATUSES = {"TRANSIT", "PENDING"}
 FINAL_ORDER_STATUSES = TRADED_STATUSES | FAILED_STATUSES
-PENDING_LEDGER_STATUSES = {"PENDING_ENTRY", "PENDING_EXIT", "PENDING_PYRAMID", "PENDING_ORDER", "TRANSIT", "PENDING"}
+PENDING_LEDGER_STATUSES = {"PENDING_ENTRY", "PENDING_EXIT", "PENDING_PYRAMID", "PENDING_ORDER", "TRANSIT", "PENDING"} | PARTIAL_FILL_STATUSES
 
 
 def _today_key() -> str:
@@ -431,7 +434,9 @@ class DhanAlgoEngine:
 
     def _mark_latest_order_applied(self, correlation_id: str) -> None:
         if correlation_id:
-            self._update_ledger_order(correlation_id, {"applied_to_position": True})
+            record = (self.ledger.get("orders") or {}).get(correlation_id) or {}
+            applied_quantity = int(record.get("traded_quantity") or record.get("quantity") or 0)
+            self._update_ledger_order(correlation_id, {"applied_to_position": True, "applied_quantity": applied_quantity})
 
     def _update_ledger_order_from_broker(self, row: dict[str, Any], fallback_correlation_id: str = "") -> str:
         correlation_id = _broker_correlation_id(row) or fallback_correlation_id
@@ -446,6 +451,11 @@ class DhanAlgoEngine:
         status = _broker_order_status(row)
         average_price = self._average_price_from_order(row)
         traded_quantity = _broker_quantity(row, "filledQty", "tradedQuantity", "tradedQty", "quantity")
+        requested_quantity = 0
+        if correlation_id:
+            requested_quantity = int(((self.ledger.get("orders") or {}).get(correlation_id) or {}).get("quantity") or 0)
+        if traded_quantity > 0 and requested_quantity > 0 and traded_quantity < requested_quantity:
+            status = "PARTIALLY_FILLED"
         self._update_ledger_order(
             correlation_id,
             {
@@ -453,6 +463,7 @@ class DhanAlgoEngine:
                 "status": status or None,
                 "average_price": average_price or None,
                 "traded_quantity": traded_quantity or None,
+                "remaining_quantity": max(0, requested_quantity - traded_quantity) if requested_quantity else None,
                 "raw": row,
             },
         )
@@ -914,7 +925,7 @@ class DhanAlgoEngine:
             },
         )
         status = order.get("status", "")
-        if str(status).upper() not in TRADED_STATUSES:
+        if str(status).upper() not in FILL_ACCEPTED_STATUSES:
             reason = self._order_failure_reason(order)
             suffix = f": {reason}" if reason else "."
             self.event("ERROR", f"{instrument.symbol} entry not opened because order status is {status or 'UNKNOWN'}{suffix}")
@@ -1063,7 +1074,7 @@ class DhanAlgoEngine:
             },
         )
         status = str(order.get("status") or "").upper()
-        if status not in TRADED_STATUSES:
+        if status not in FILL_ACCEPTED_STATUSES:
             reason = self._order_failure_reason(order)
             suffix = f": {reason}" if reason else "."
             self.event("ERROR", f"{instrument.symbol} scalper {side.lower()} not opened because order status is {status or 'UNKNOWN'}{suffix}")
@@ -1228,7 +1239,7 @@ class DhanAlgoEngine:
                 metadata={"pyramid_add": next_add, "initial_quantity": initial_quantity},
             )
             status = str(order.get("status") or "").upper()
-            if status not in TRADED_STATUSES:
+            if status not in FILL_ACCEPTED_STATUSES:
                 reason = self._order_failure_reason(order)
                 suffix = f": {reason}" if reason else ""
                 self.event("ERROR", f"{position.symbol} scalper pyramid add {next_add} failed with status {status or 'UNKNOWN'}{suffix}; algo quantity unchanged.")
@@ -1281,7 +1292,7 @@ class DhanAlgoEngine:
             metadata={"reason": reason},
         )
         status = str(order.get("status") or "").upper()
-        if status not in TRADED_STATUSES:
+        if status not in FILL_ACCEPTED_STATUSES:
             failure = self._order_failure_reason(order)
             suffix = f": {failure}" if failure else "."
             self.event("ERROR", f"{position.symbol} exit {reason} not marked closed because order status is {status or 'UNKNOWN'}{suffix}")
@@ -1409,9 +1420,16 @@ class DhanAlgoEngine:
             self._update_ledger_order(attempt_correlation_id, {"order_id": order_id, "status": status, "raw": result})
             final_status = await self._wait_order_status(order_id, status)
             last_result["status"] = final_status
-            details = await self._order_fill_details(order_id, reference_price if final_status in TRADED_STATUSES else 0)
+            details = await self._order_fill_details(order_id, reference_price if final_status in FILL_ACCEPTED_STATUSES else 0)
             last_result.update(details)
-            if final_status not in TRADED_STATUSES:
+            traded_quantity = int(details.get("traded_quantity") or 0)
+            if traded_quantity > 0 and traded_quantity < int(quantity):
+                final_status = "PARTIALLY_FILLED"
+                last_result["status"] = final_status
+            elif traded_quantity >= int(quantity) and final_status in PARTIAL_FILL_STATUSES:
+                final_status = "TRADED"
+                last_result["status"] = final_status
+            if final_status not in FILL_ACCEPTED_STATUSES:
                 detail = await self._order_detail(order_id)
                 if detail:
                     last_result["raw_detail"] = detail
@@ -1426,7 +1444,7 @@ class DhanAlgoEngine:
                     "error_message": last_result.get("error_message") or None,
                 },
             )
-            if final_status in TRADED_STATUSES:
+            if final_status in FILL_ACCEPTED_STATUSES:
                 return last_result
             if order_id and final_status in PENDING_STATUSES:
                 try:
@@ -1445,7 +1463,7 @@ class DhanAlgoEngine:
                     )
                     last_result.update(refreshed)
                     refreshed_status = str(refreshed.get("status") or "").upper()
-                    if refreshed_status in TRADED_STATUSES:
+                    if refreshed_status in FILL_ACCEPTED_STATUSES:
                         return last_result
                     if refreshed_status == "TRADED_UNCONFIRMED":
                         return last_result
@@ -1472,9 +1490,12 @@ class DhanAlgoEngine:
         status = implied_status or detail_status or fallback_status or "UNKNOWN"
         fill_details = await self._order_fill_details(
             order_id,
-            reference_price if status in TRADED_STATUSES else 0,
+            reference_price if status in FILL_ACCEPTED_STATUSES else 0,
         )
         traded_quantity = int(fill_details.get("traded_quantity") or 0)
+        requested_quantity = int(((self.ledger.get("orders") or {}).get(correlation_id) or {}).get("quantity") or 0)
+        if traded_quantity > 0 and requested_quantity > 0 and traded_quantity < requested_quantity:
+            status = "PARTIALLY_FILLED"
         if implied_status in TRADED_STATUSES and traded_quantity <= 0:
             status = "TRADED_UNCONFIRMED"
             error_message = (
@@ -1482,7 +1503,7 @@ class DhanAlgoEngine:
                 "Retry stopped to avoid duplicate quantity; broker reconcile must repair state."
             )[:1000]
             self.event("ERROR", f"{instrument.symbol} order {order_id} traded at broker but quantity is unconfirmed; retry stopped.")
-        elif status in TRADED_STATUSES and traded_quantity > 0:
+        elif status in FILL_ACCEPTED_STATUSES and traded_quantity > 0:
             self.event("INFO", f"{instrument.symbol} order {order_id} traded while cancel was being requested; using broker fill and stopping retry.")
         elif status in FAILED_STATUSES:
             error_message = f"{error_message} | Broker status after cancel reject: {status}"[:1000]
@@ -1568,7 +1589,7 @@ class DhanAlgoEngine:
             update = self.order_updates.get(order_id)
             if update:
                 status = str(update.get("Status") or update.get("OrderStatus") or update.get("orderStatus") or status).upper()
-                if status in TRADED_STATUSES | FAILED_STATUSES:
+                if status in FILL_ACCEPTED_STATUSES | FAILED_STATUSES:
                     return status
             await asyncio.sleep(0.1)
         try:
@@ -1688,9 +1709,34 @@ class DhanAlgoEngine:
             timings,
             timeout=BROKER_POSITIONS_TIMEOUT_SECONDS,
         )
-        broker_net = self._broker_net_quantities(broker_positions)
-        app_net = self._app_net_quantities()
+        broker_position_details = self._broker_position_details(broker_positions)
+        broker_net = {security_id: int(row.get("quantity") or 0) for security_id, row in broker_position_details.items()}
         active_ledger_orders = self._active_ledger_orders()
+        trade_book: list[dict[str, Any]] = []
+        trade_book_available = True
+        trade_book_error = ""
+        trade_recovery = {"orders_updated": 0, "unmatched_trades": 0, "partial_orders": 0}
+        self.broker_reconcile_status = {
+            **self.broker_reconcile_status,
+            "message": "Checking broker trade book",
+            "timings": timings,
+        }
+        try:
+            trade_book = await self._timed_broker_call(
+                "trade book",
+                self.client.trade_book,
+                timings,
+                timeout=BROKER_TRADE_BOOK_TIMEOUT_SECONDS,
+            )
+            trade_recovery = self._apply_trade_book_fills(trade_book)
+        except Exception as exc:
+            trade_book_available = False
+            trade_book_error = (
+                f"trade book timed out after {BROKER_TRADE_BOOK_TIMEOUT_SECONDS:g}s"
+                if isinstance(exc, asyncio.TimeoutError)
+                else str(exc)
+            )
+            self.event("WARN", f"Broker trade book unavailable: {trade_book_error}")
         order_book: list[dict[str, Any]] = []
         order_book_available = True
         order_book_error = ""
@@ -1736,6 +1782,8 @@ class DhanAlgoEngine:
                 order_book_error = f"Pending ledger recovery timed out after {BROKER_PENDING_RECOVERY_TIMEOUT_SECONDS:g}s"
                 self.event("WARN", order_book_error)
         self._apply_unapplied_traded_orders()
+        app_net = self._app_net_quantities()
+        app_avg = self._app_average_prices()
         relevant_sids = set(app_net) | set(broker_net) | self._ledger_security_ids() | set(self.instruments_by_security)
         mismatches = []
         for security_id in sorted(relevant_sids):
@@ -1759,6 +1807,9 @@ class DhanAlgoEngine:
             pending_orders = self._pending_items_from_ledger(active_after_recovery)
             failed_orders = []
         self.entries_blocked_until_reconcile = False
+        ledger_security_ids = self._ledger_security_ids()
+        external_positions = self._external_broker_positions(broker_net, app_net, ledger_security_ids)
+        avg_mismatches = self._average_price_mismatches(broker_position_details, app_avg, app_net)
         new_locked = {
             row["symbol"]
             for row in mismatches
@@ -1767,13 +1818,25 @@ class DhanAlgoEngine:
             row.get("symbol", "")
             for row in pending_orders
             if row.get("symbol")
+        } | {
+            row.get("symbol", "")
+            for row in external_positions
+            if row.get("symbol")
+        } | {
+            row.get("symbol", "")
+            for row in avg_mismatches
+            if row.get("symbol")
         }
         previous_locked = set(self.locked_symbols)
         self.locked_symbols = {symbol for symbol in new_locked if symbol}
         if self.locked_symbols and self.locked_symbols != previous_locked:
             self.event("ERROR", f"Broker/app mismatch lock active: {', '.join(sorted(self.locked_symbols))}")
-        if mismatches or pending_orders:
-            message = f"Broker reconcile locked {len(self.locked_symbols)} symbols | mismatches {len(mismatches)} | pending {len(pending_orders)}"
+        if mismatches or pending_orders or external_positions or avg_mismatches:
+            message = (
+                f"Broker reconcile locked {len(self.locked_symbols)} symbols | "
+                f"mismatches {len(mismatches)} | pending {len(pending_orders)} | "
+                f"external {len(external_positions)} | avg {len(avg_mismatches)}"
+            )
         elif order_book_available:
             message = "Broker reconcile OK"
         else:
@@ -1788,10 +1851,15 @@ class DhanAlgoEngine:
             "mismatches": mismatches,
             "pending_orders": pending_orders,
             "failed_orders": failed_orders,
+            "external_positions": external_positions,
+            "avg_mismatches": avg_mismatches,
             "locked_symbols": sorted(self.locked_symbols),
             "entries_blocked_until_reconcile": self.entries_blocked_until_reconcile,
             "timings": timings,
             "pending_recovery": pending_recovery,
+            "trade_recovery": trade_recovery,
+            "trade_book_available": trade_book_available,
+            "trade_book_error": trade_book_error,
             "order_book_available": order_book_available,
             "order_book_error": order_book_error,
         }
@@ -1833,6 +1901,64 @@ class DhanAlgoEngine:
             )
             merged[key] = item
         return list(merged.values())
+
+    def _apply_trade_book_fills(self, trades: list[dict[str, Any]]) -> dict[str, int]:
+        fills: dict[str, dict[str, Any]] = {}
+        for trade in trades:
+            order_id = _broker_order_id(trade)
+            if not order_id:
+                continue
+            qty = _broker_quantity(trade, "tradedQuantity", "tradedQty", "filledQty", "quantity", "qty")
+            price = _broker_price(trade, "tradedPrice", "tradePrice", "price", "averageTradedPrice", "averagePrice")
+            if qty <= 0:
+                continue
+            item = fills.setdefault(
+                order_id,
+                {
+                    "order_id": order_id,
+                    "quantity": 0,
+                    "value": 0.0,
+                    "raw_trades": [],
+                },
+            )
+            item["quantity"] += qty
+            if price > 0:
+                item["value"] += qty * price
+            item["raw_trades"].append(trade)
+        orders_updated = 0
+        unmatched = 0
+        partial = 0
+        for order_id, fill in fills.items():
+            correlation_id, record = self._ledger_record_by_order_id(order_id)
+            if not correlation_id or not record:
+                unmatched += 1
+                continue
+            traded_quantity = int(fill["quantity"])
+            requested_quantity = int(record.get("quantity") or 0)
+            average_price = (float(fill["value"]) / traded_quantity) if traded_quantity > 0 and fill["value"] else 0.0
+            status = "TRADED"
+            if requested_quantity > 0 and traded_quantity < requested_quantity:
+                status = "PARTIALLY_FILLED"
+                partial += 1
+            self._update_ledger_order(
+                correlation_id,
+                {
+                    "order_id": order_id,
+                    "status": status,
+                    "average_price": round(average_price, 4) if average_price > 0 else None,
+                    "traded_quantity": traded_quantity,
+                    "remaining_quantity": max(0, requested_quantity - traded_quantity) if requested_quantity else None,
+                    "raw_trades": fill["raw_trades"],
+                },
+            )
+            orders_updated += 1
+        return {"orders_updated": orders_updated, "unmatched_trades": unmatched, "partial_orders": partial}
+
+    def _ledger_record_by_order_id(self, order_id: str) -> tuple[str, dict[str, Any] | None]:
+        for correlation_id, record in (self.ledger.get("orders") or {}).items():
+            if order_id and str(record.get("order_id") or "") == order_id:
+                return correlation_id, record
+        return "", None
 
     def _ledger_order_is_from_today(self, record: dict[str, Any]) -> bool:
         today = _today_key()
@@ -1904,13 +2030,19 @@ class DhanAlgoEngine:
     def _apply_unapplied_traded_orders(self) -> None:
         for correlation_id, record in list((self.ledger.get("orders") or {}).items()):
             status = str(record.get("status") or "").upper()
-            if status not in TRADED_STATUSES or record.get("applied_to_position"):
+            if status not in FILL_ACCEPTED_STATUSES:
                 continue
             role = str(record.get("order_role") or "").upper()
             position_key = str(record.get("position_key") or "")
             metadata = record.get("metadata") or {}
             fill_price = float(record.get("average_price") or metadata.get("reference_price") or 0)
-            quantity = int(record.get("traded_quantity") or record.get("quantity") or 0)
+            traded_quantity = int(record.get("traded_quantity") or record.get("quantity") or 0)
+            applied_quantity = int(record.get("applied_quantity") or 0)
+            quantity = max(0, traded_quantity - applied_quantity)
+            if quantity <= 0:
+                if status in TRADED_STATUSES and not record.get("applied_to_position"):
+                    self._mark_latest_order_applied(correlation_id)
+                continue
             if role == "ENTRY":
                 self._recover_entry_position(position_key, record, metadata, fill_price, quantity)
             elif role == "PYRAMID":
@@ -1918,9 +2050,13 @@ class DhanAlgoEngine:
             elif role == "EXIT":
                 position = self.positions.get(position_key)
                 if position:
-                    position.status = "CLOSED"
                     position.exit_order_id = str(record.get("order_id") or "")
-                    position.exit_reason = str(metadata.get("reason") or "RECOVERED_EXIT")
+                    if quantity < position.quantity:
+                        position.quantity -= quantity
+                        position.exit_reason = f"PARTIAL_{str(metadata.get('reason') or 'RECOVERED_EXIT')}"
+                    else:
+                        position.status = "CLOSED"
+                        position.exit_reason = str(metadata.get("reason") or "RECOVERED_EXIT")
                     self._persist_position(position)
             self._mark_latest_order_applied(correlation_id)
 
@@ -1983,6 +2119,45 @@ class DhanAlgoEngine:
                 broker_net[security_id] = broker_net.get(security_id, 0) + net_qty
         return broker_net
 
+    def _broker_position_details(self, rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
+        details: dict[str, dict[str, Any]] = {}
+        for row in rows:
+            security_id = str(row.get("securityId") or row.get("security_id") or "")
+            if not security_id:
+                continue
+            product_type = str(row.get("productType") or "").upper()
+            if product_type and product_type != "INTRADAY":
+                continue
+            net_qty = _broker_quantity(row, "netQty", "netQuantity")
+            if not net_qty:
+                continue
+            avg_price = self._broker_position_average(row, net_qty)
+            item = details.setdefault(
+                security_id,
+                {
+                    "security_id": security_id,
+                    "symbol": self._symbol_for_security(security_id),
+                    "quantity": 0,
+                    "average_price": 0.0,
+                    "raw": [],
+                },
+            )
+            old_qty = abs(int(item["quantity"]))
+            new_qty = abs(int(net_qty))
+            if avg_price > 0:
+                total_qty = old_qty + new_qty
+                item["average_price"] = ((float(item["average_price"]) * old_qty) + (avg_price * new_qty)) / total_qty if total_qty else avg_price
+            item["quantity"] = int(item["quantity"]) + net_qty
+            item["raw"].append(row)
+        for item in details.values():
+            item["average_price"] = round(float(item.get("average_price") or 0), 4)
+        return details
+
+    def _broker_position_average(self, row: dict[str, Any], net_qty: int) -> float:
+        if net_qty < 0:
+            return _broker_price(row, "sellAvg", "sellAvgPrice", "sellAveragePrice", "averagePrice", "avgPrice", "netAvg", "netAveragePrice")
+        return _broker_price(row, "buyAvg", "buyAvgPrice", "buyAveragePrice", "averagePrice", "avgPrice", "netAvg", "netAveragePrice")
+
     def _app_net_quantities(self) -> dict[str, int]:
         app_net: dict[str, int] = {}
         for position in self.positions.values():
@@ -1991,6 +2166,74 @@ class DhanAlgoEngine:
             sign = -1 if position.side == "SHORT" else 1
             app_net[str(position.security_id)] = app_net.get(str(position.security_id), 0) + sign * int(position.quantity)
         return app_net
+
+    def _app_average_prices(self) -> dict[str, float]:
+        totals: dict[str, dict[str, float]] = {}
+        for position in self.positions.values():
+            if position.status != "OPEN":
+                continue
+            security_id = str(position.security_id)
+            qty = abs(int(position.quantity or 0))
+            price = float(position.entry_price or 0)
+            if qty <= 0 or price <= 0:
+                continue
+            item = totals.setdefault(security_id, {"quantity": 0.0, "value": 0.0})
+            item["quantity"] += qty
+            item["value"] += qty * price
+        return {
+            security_id: round(row["value"] / row["quantity"], 4)
+            for security_id, row in totals.items()
+            if row["quantity"] > 0
+        }
+
+    def _external_broker_positions(self, broker_net: dict[str, int], app_net: dict[str, int], ledger_security_ids: set[str]) -> list[dict[str, Any]]:
+        external = []
+        for security_id, broker_qty in sorted(broker_net.items()):
+            if int(broker_qty or 0) == 0:
+                continue
+            if int(app_net.get(security_id, 0)) != 0:
+                continue
+            if security_id in ledger_security_ids:
+                continue
+            external.append(
+                {
+                    "symbol": self._symbol_for_security(security_id),
+                    "security_id": security_id,
+                    "broker_qty": int(broker_qty),
+                    "reason": "Broker intraday position has no app ledger/order correlation.",
+                }
+            )
+        return external
+
+    def _average_price_mismatches(
+        self,
+        broker_details: dict[str, dict[str, Any]],
+        app_avg: dict[str, float],
+        app_net: dict[str, int],
+    ) -> list[dict[str, Any]]:
+        mismatches = []
+        for security_id, broker in sorted(broker_details.items()):
+            broker_qty = int(broker.get("quantity") or 0)
+            app_qty = int(app_net.get(security_id, 0))
+            if broker_qty == 0 or broker_qty != app_qty:
+                continue
+            broker_avg = float(broker.get("average_price") or 0)
+            local_avg = float(app_avg.get(security_id) or 0)
+            if broker_avg <= 0 or local_avg <= 0:
+                continue
+            diff = abs(broker_avg - local_avg)
+            if diff >= max(0.05, broker_avg * 0.001):
+                mismatches.append(
+                    {
+                        "symbol": self._symbol_for_security(security_id),
+                        "security_id": security_id,
+                        "broker_qty": broker_qty,
+                        "broker_avg": round(broker_avg, 4),
+                        "app_avg": round(local_avg, 4),
+                        "diff": round(diff, 4),
+                    }
+                )
+        return mismatches
 
     def _ledger_security_ids(self) -> set[str]:
         ids = {str(record.get("security_id") or "") for record in (self.ledger.get("orders") or {}).values()}
