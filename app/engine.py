@@ -48,8 +48,8 @@ PARTIAL_FILL_STATUSES = {"PARTIAL", "PARTIALLY_FILLED", "PARTIALLY_TRADED"}
 FILL_ACCEPTED_STATUSES = TRADED_STATUSES | PARTIAL_FILL_STATUSES
 FAILED_STATUSES = {"REJECTED", "CANCELLED", "EXPIRED", "FAILED", "PLACE_FAILED", "STALE_UNRESOLVED"}
 PENDING_STATUSES = {"TRANSIT", "PENDING"}
-FINAL_ORDER_STATUSES = TRADED_STATUSES | FAILED_STATUSES
-PENDING_LEDGER_STATUSES = {"PENDING_ENTRY", "PENDING_EXIT", "PENDING_PYRAMID", "PENDING_ORDER", "TRANSIT", "PENDING"} | PARTIAL_FILL_STATUSES
+FINAL_ORDER_STATUSES = TRADED_STATUSES | PARTIAL_FILL_STATUSES | FAILED_STATUSES
+PENDING_LEDGER_STATUSES = {"PENDING_ENTRY", "PENDING_EXIT", "PENDING_PYRAMID", "PENDING_ORDER", "TRANSIT", "PENDING"}
 
 
 def _today_key() -> str:
@@ -1809,7 +1809,7 @@ class DhanAlgoEngine:
         self.entries_blocked_until_reconcile = False
         ledger_security_ids = self._ledger_security_ids()
         external_positions = self._external_broker_positions(broker_net, app_net, ledger_security_ids)
-        avg_mismatches = self._average_price_mismatches(broker_position_details, app_avg, app_net)
+        avg_syncs = self._sync_average_price_mismatches(broker_position_details, app_avg, app_net)
         new_locked = {
             row["symbol"]
             for row in mismatches
@@ -1822,21 +1822,19 @@ class DhanAlgoEngine:
             row.get("symbol", "")
             for row in external_positions
             if row.get("symbol")
-        } | {
-            row.get("symbol", "")
-            for row in avg_mismatches
-            if row.get("symbol")
         }
         previous_locked = set(self.locked_symbols)
         self.locked_symbols = {symbol for symbol in new_locked if symbol}
         if self.locked_symbols and self.locked_symbols != previous_locked:
             self.event("ERROR", f"Broker/app mismatch lock active: {', '.join(sorted(self.locked_symbols))}")
-        if mismatches or pending_orders or external_positions or avg_mismatches:
+        if mismatches or pending_orders or external_positions:
             message = (
                 f"Broker reconcile locked {len(self.locked_symbols)} symbols | "
                 f"mismatches {len(mismatches)} | pending {len(pending_orders)} | "
-                f"external {len(external_positions)} | avg {len(avg_mismatches)}"
+                f"external {len(external_positions)} | avg synced {len(avg_syncs)}"
             )
+        elif avg_syncs:
+            message = f"Broker reconcile OK | avg synced {len(avg_syncs)}"
         elif order_book_available:
             message = "Broker reconcile OK"
         else:
@@ -1852,7 +1850,8 @@ class DhanAlgoEngine:
             "pending_orders": pending_orders,
             "failed_orders": failed_orders,
             "external_positions": external_positions,
-            "avg_mismatches": avg_mismatches,
+            "avg_mismatches": [],
+            "avg_syncs": avg_syncs,
             "locked_symbols": sorted(self.locked_symbols),
             "entries_blocked_until_reconcile": self.entries_blocked_until_reconcile,
             "timings": timings,
@@ -2205,13 +2204,13 @@ class DhanAlgoEngine:
             )
         return external
 
-    def _average_price_mismatches(
+    def _sync_average_price_mismatches(
         self,
         broker_details: dict[str, dict[str, Any]],
         app_avg: dict[str, float],
         app_net: dict[str, int],
     ) -> list[dict[str, Any]]:
-        mismatches = []
+        synced = []
         for security_id, broker in sorted(broker_details.items()):
             broker_qty = int(broker.get("quantity") or 0)
             app_qty = int(app_net.get(security_id, 0))
@@ -2223,7 +2222,8 @@ class DhanAlgoEngine:
                 continue
             diff = abs(broker_avg - local_avg)
             if diff >= max(0.05, broker_avg * 0.001):
-                mismatches.append(
+                sync_rows = self._sync_open_position_average(security_id, broker_avg)
+                synced.append(
                     {
                         "symbol": self._symbol_for_security(security_id),
                         "security_id": security_id,
@@ -2231,9 +2231,25 @@ class DhanAlgoEngine:
                         "broker_avg": round(broker_avg, 4),
                         "app_avg": round(local_avg, 4),
                         "diff": round(diff, 4),
+                        "positions_synced": sync_rows,
                     }
                 )
-        return mismatches
+        return synced
+
+    def _sync_open_position_average(self, security_id: str, broker_avg: float) -> int:
+        updated = 0
+        for position in self.positions.values():
+            if position.status != "OPEN" or str(position.security_id) != str(security_id):
+                continue
+            old_entry = float(position.entry_price or 0)
+            position.entry_price = round(float(broker_avg), 2)
+            position.last_price = position.last_price or position.entry_price
+            position.meta["broker_avg_synced"] = True
+            position.meta["previous_app_entry_price"] = old_entry
+            position.meta["broker_average_price"] = round(float(broker_avg), 4)
+            self._persist_position(position)
+            updated += 1
+        return updated
 
     def _ledger_security_ids(self) -> set[str]:
         ids = {str(record.get("security_id") or "") for record in (self.ledger.get("orders") or {}).values()}
