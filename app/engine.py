@@ -20,6 +20,7 @@ from .config import (
     BROKER_TRADE_BOOK_TIMEOUT_SECONDS,
     DHAN_FEED_URL,
     DHAN_ORDER_UPDATE_URL,
+    EXECUTION_WORKER_COUNT,
     MAX_INSTRUMENTS_PER_CONNECTION,
     MAX_MARKET_FEED_CONNECTIONS,
     MAX_SUBSCRIBE_BATCH,
@@ -276,10 +277,18 @@ class DhanAlgoEngine:
         self.feed_sockets: list[Any] = []
         self.order_task: asyncio.Task | None = None
         self.tick_task: asyncio.Task | None = None
+        self.execution_task: asyncio.Task | None = None
+        self.execution_tasks: set[asyncio.Task] = set()
+        self.snapshot_task: asyncio.Task | None = None
         self.cache_task: asyncio.Task | None = None
         self.reconcile_task: asyncio.Task | None = None
         self.broker_reconcile_task: asyncio.Task | None = None
         self.action_tasks: set[asyncio.Task] = set()
+        self.execution_queue: asyncio.PriorityQueue[tuple[int, int, str, Any]] | None = None
+        self.action_sequence = 0
+        self.symbol_action_locks: dict[str, asyncio.Lock] = {}
+        self.snapshot_cache: dict[str, Any] = {}
+        self.snapshot_cache_ts = 0.0
         self.pending_actions: set[str] = set()
         self.credentials: dict[str, str] = {}
         self.long_symbols: list[str] = []
@@ -543,29 +552,47 @@ class DhanAlgoEngine:
             or self._extract_error_message(order.get("raw"))
         )
 
-    def _schedule_action(self, key: str, factory: Any) -> bool:
+    def _schedule_action(self, key: str, factory: Any, priority: int = 50) -> bool:
         if key in self.pending_actions:
             return False
+        symbol = self._action_symbol(key)
+        if not key.startswith("EXIT:") and any(self._action_symbol(pending) == symbol for pending in self.pending_actions):
+            return False
+        if self.execution_queue is None:
+            self.execution_queue = asyncio.PriorityQueue()
         self.pending_actions.add(key)
-        task = asyncio.create_task(self._run_scheduled_action(key, factory))
-        self.action_tasks.add(task)
-        task.add_done_callback(self.action_tasks.discard)
+        self.action_sequence += 1
+        self.execution_queue.put_nowait((priority, self.action_sequence, key, factory))
         return True
 
-    async def _run_scheduled_action(self, key: str, factory: Any) -> None:
-        try:
-            await factory()
-        except asyncio.CancelledError:
-            raise
-        except DhanAuthenticationError as exc:
-            self._handle_auth_failure("Order action", exc)
-        except Exception as exc:
-            if _is_auth_error(exc):
+    def _action_symbol(self, key: str) -> str:
+        parts = key.split(":", 2)
+        return parts[1] if len(parts) > 1 else key
+
+    async def _execution_worker(self) -> None:
+        assert self.execution_queue is not None
+        while self.running:
+            _priority, _sequence, key, factory = await self.execution_queue.get()
+            try:
+                symbol = self._action_symbol(key)
+                lock = self.symbol_action_locks.get(symbol)
+                if lock is None:
+                    lock = asyncio.Lock()
+                    self.symbol_action_locks[symbol] = lock
+                async with lock:
+                    await factory()
+            except asyncio.CancelledError:
+                raise
+            except DhanAuthenticationError as exc:
                 self._handle_auth_failure("Order action", exc)
-                return
-            self.event("ERROR", f"Order action failed: {exc}")
-        finally:
-            self.pending_actions.discard(key)
+            except Exception as exc:
+                if _is_auth_error(exc):
+                    self._handle_auth_failure("Order action", exc)
+                    return
+                self.event("ERROR", f"Order action failed: {exc}")
+            finally:
+                self.pending_actions.discard(key)
+                self.execution_queue.task_done()
 
     def _handle_auth_failure(self, source: str, exc: Exception) -> None:
         self.last_error = f"{source}: Dhan credentials invalid or expired. Update client ID/access token and restart algo."
@@ -594,7 +621,7 @@ class DhanAlgoEngine:
             current = asyncio.current_task()
         except RuntimeError:
             current = None
-        for task in (self.tick_task, self.order_task, self.reconcile_task, self.broker_reconcile_task, *list(self.action_tasks)):
+        for task in (self.tick_task, self.order_task, self.execution_task, self.snapshot_task, self.reconcile_task, self.broker_reconcile_task, *list(self.execution_tasks), *list(self.action_tasks)):
             if task and task is not current and not task.done():
                 task.cancel()
 
@@ -631,7 +658,7 @@ class DhanAlgoEngine:
             if self.running and set(self.instruments_by_security) != old_security_ids:
                 self._restart_market_feed_threads()
             self.save_state()
-        return self.snapshot()
+        return self.snapshot(fresh=True)
 
     def _resolve_watchlists(self) -> None:
         all_symbols = list(dict.fromkeys(self.long_symbols + self.short_symbols))
@@ -650,10 +677,16 @@ class DhanAlgoEngine:
     async def start(self) -> dict[str, Any]:
         if self.running:
             self.event("INFO", "Algo is already running.")
-            return self.snapshot()
+            return self.snapshot(fresh=True)
         self.event("INFO", "Start requested; running startup checks.")
         self.loop = asyncio.get_running_loop()
         self.tick_queue = asyncio.Queue(maxsize=TICK_QUEUE_MAXSIZE)
+        self.execution_queue = asyncio.PriorityQueue()
+        self.pending_actions = set()
+        self.symbol_action_locks = {}
+        self.execution_tasks = set()
+        self.snapshot_cache = {}
+        self.snapshot_cache_ts = 0.0
         if not self.client:
             if self.credentials.get("client_id") and self.credentials.get("access_token"):
                 self.client = DhanClient(self.credentials["client_id"], self.credentials["access_token"])
@@ -681,12 +714,15 @@ class DhanAlgoEngine:
         self.scalper_state = {}
         self.feed_generation += 1
         self.tick_task = asyncio.create_task(self._tick_worker())
+        self.execution_tasks = {asyncio.create_task(self._execution_worker()) for _ in range(max(1, EXECUTION_WORKER_COUNT))}
+        self.execution_task = next(iter(self.execution_tasks))
+        self.snapshot_task = asyncio.create_task(self._snapshot_worker())
         self.order_task = asyncio.create_task(self._order_update_worker())
         self.reconcile_task = asyncio.create_task(self._auto_reconcile_worker())
         self.broker_reconcile_task = asyncio.create_task(self._broker_reconcile_worker())
         self._start_market_feed_threads(self.feed_generation)
         self.event("INFO", f"Algo started with {len(self.instruments_by_symbol)} stocks and {len(self.sector_instruments)} sector indexes on {self.settings.timeframe}m.")
-        return self.snapshot()
+        return self.snapshot(fresh=True)
 
     async def stop(self) -> dict[str, Any]:
         self.running = False
@@ -694,11 +730,17 @@ class DhanAlgoEngine:
         self.market_connected = False
         self.order_connected = False
         self._close_market_feed_sockets()
-        for task in (self.tick_task, self.order_task, self.reconcile_task, self.broker_reconcile_task, *list(self.action_tasks)):
+        for task in (self.tick_task, self.order_task, self.execution_task, self.snapshot_task, self.reconcile_task, self.broker_reconcile_task, *list(self.execution_tasks), *list(self.action_tasks)):
             if task:
                 task.cancel()
+        self.execution_queue = None
+        self.execution_tasks = set()
+        self.execution_task = None
+        self.symbol_action_locks = {}
+        self.snapshot_task = None
+        self.pending_actions.clear()
         self.event("INFO", "Algo stopped.")
-        return self.snapshot()
+        return self.snapshot(fresh=True)
 
     def _restart_market_feed_threads(self) -> None:
         max_subscriptions = MAX_MARKET_FEED_CONNECTIONS * MAX_INSTRUMENTS_PER_CONNECTION
@@ -865,6 +907,7 @@ class DhanAlgoEngine:
             self._schedule_action(
                 f"ENTRY:{instrument.symbol}:LONG",
                 lambda instrument=instrument, signal=signal: self._enter_position(instrument, signal),
+                priority=50,
             )
 
     async def _evaluate_closed_candle(self, instrument: Instrument, candle: Candle) -> None:
@@ -881,6 +924,7 @@ class DhanAlgoEngine:
                     self._schedule_action(
                         f"EXIT:{position.symbol}:{position.side}",
                         lambda position=position, reason=reason: self._exit_position(position, reason),
+                        priority=0,
                     )
         if symbol not in self.long_symbols or self._has_open_position(symbol):
             return
@@ -894,6 +938,7 @@ class DhanAlgoEngine:
                 self._schedule_action(
                     f"ENTRY:{instrument.symbol}:LONG",
                     lambda instrument=instrument, event=event: self._enter_position(instrument, event),
+                    priority=50,
                 )
 
     async def _enter_position(self, instrument: Instrument, signal: dict[str, Any]) -> None:
@@ -976,6 +1021,7 @@ class DhanAlgoEngine:
                 self._schedule_action(
                     f"ENTRY:{instrument.symbol}:LONG",
                     lambda instrument=instrument, price=price: self._enter_scalper_position(instrument, "LONG", price, "Break above scalper reference high"),
+                    priority=50,
                 )
                 return
         if want_short and not state.get("short_triggered"):
@@ -984,6 +1030,7 @@ class DhanAlgoEngine:
                 self._schedule_action(
                     f"ENTRY:{instrument.symbol}:SHORT",
                     lambda instrument=instrument, price=price: self._enter_scalper_position(instrument, "SHORT", price, "Break below scalper reference low"),
+                    priority=50,
                 )
 
     def _scalper_reference_state(self, symbol: str, price: float, timestamp: datetime) -> dict[str, Any]:
@@ -1150,6 +1197,7 @@ class DhanAlgoEngine:
             self._schedule_action(
                 f"EXIT:{position.symbol}:{position.side}",
                 lambda position=position, reason=reason: self._exit_position(position, reason),
+                priority=0,
             )
             return
         self._trail_scalper_to_breakeven(position, price)
@@ -1157,6 +1205,7 @@ class DhanAlgoEngine:
             self._schedule_action(
                 f"PYRAMID:{position.symbol}:{position.side}",
                 lambda position=position, instrument=instrument, price=price: self._maybe_pyramid_scalper(position, instrument, price),
+                priority=20,
             )
 
     def _scalper_exit_reason(self, position: Position, price: float) -> str:
@@ -2833,7 +2882,28 @@ class DhanAlgoEngine:
         self.events.insert(0, {"time": datetime.now(IST).isoformat(), "kind": kind, "message": message})
         del self.events[200:]
 
-    def snapshot(self) -> dict[str, Any]:
+    async def _snapshot_worker(self) -> None:
+        while self.running:
+            try:
+                self._refresh_snapshot_cache()
+            except Exception as exc:
+                self.event("ERROR", f"Snapshot refresh failed: {exc}")
+            await asyncio.sleep(1.0)
+
+    def _refresh_snapshot_cache(self) -> dict[str, Any]:
+        snapshot = self._build_snapshot()
+        self.snapshot_cache = snapshot
+        self.snapshot_cache_ts = time.monotonic()
+        return snapshot
+
+    def snapshot(self, fresh: bool = False) -> dict[str, Any]:
+        if fresh or not self.running or not self.snapshot_cache:
+            return self._refresh_snapshot_cache()
+        if time.monotonic() - self.snapshot_cache_ts > 2.5:
+            return self._refresh_snapshot_cache()
+        return dict(self.snapshot_cache)
+
+    def _build_snapshot(self) -> dict[str, Any]:
         with self.lock:
             symbols = sorted(self.instruments_by_symbol)
             latest = []
@@ -2864,6 +2934,8 @@ class DhanAlgoEngine:
                 "tick_queue_size": self.tick_queue.qsize() if self.tick_queue else 0,
                 "tick_queue_maxsize": self.tick_queue.maxsize if self.tick_queue else TICK_QUEUE_MAXSIZE,
                 "dropped_ticks": self.dropped_ticks,
+                "execution_queue_size": self.execution_queue.qsize() if self.execution_queue else 0,
+                "execution_workers": sum(1 for task in self.execution_tasks if not task.done()),
                 "pending_actions": sorted(self.pending_actions),
                 "settings": self.settings.__dict__,
                 "credentials_present": bool(self.credentials.get("client_id") and self.credentials.get("access_token")),

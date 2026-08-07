@@ -58,7 +58,7 @@ async def premarket_cache(payload: dict = Body(default={})):
     if payload:
         engine.configure(payload)
     await engine.run_premarket_cache(force=bool(payload.get("force", False)))
-    return engine.snapshot()
+    return engine.snapshot(fresh=True)
 
 
 @app.get("/api/premarket-report")
@@ -84,7 +84,7 @@ async def reconcile(symbol: str):
 async def broker_reconcile():
     try:
         await asyncio.wait_for(engine.reconcile_broker_state(), timeout=BROKER_RECONCILE_TIMEOUT_SECONDS)
-        return engine.snapshot()
+        return engine.snapshot(fresh=True)
     except asyncio.TimeoutError:
         message = f"Broker reconcile timed out after {BROKER_RECONCILE_TIMEOUT_SECONDS:g}s."
         engine.entries_blocked_until_reconcile = False
@@ -95,6 +95,6 @@ async def broker_reconcile():
             "entries_blocked_until_reconcile": False,
         }
         engine.event("WARN", engine.broker_reconcile_status["message"])
-        return engine.snapshot()
+        return engine.snapshot(fresh=True)
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
