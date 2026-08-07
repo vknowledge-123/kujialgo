@@ -1430,12 +1430,88 @@ class DhanAlgoEngine:
                     await self.client.cancel_order(order_id)
                     self._update_ledger_order(attempt_correlation_id, {"status": "CANCEL_REQUESTED"})
                 except Exception as exc:
+                    if isinstance(exc, DhanAuthenticationError) or _is_auth_error(exc):
+                        raise
+                    refreshed = await self._refresh_after_cancel_reject(
+                        instrument,
+                        order_id,
+                        attempt_correlation_id,
+                        final_status,
+                        reference_price,
+                        exc,
+                    )
+                    last_result.update(refreshed)
+                    refreshed_status = str(refreshed.get("status") or "").upper()
+                    if refreshed_status in TRADED_STATUSES:
+                        return last_result
+                    if refreshed_status == "TRADED_UNCONFIRMED":
+                        return last_result
                     self.event("WARN", f"Cancel before retry failed for {instrument.symbol}: {exc}")
             await asyncio.sleep(0.25 * attempt)
         reason = self._order_failure_reason(last_result)
         suffix = f": {reason}" if reason else ""
         self.event("ERROR", f"{instrument.symbol} {transaction_type} failed after 3 attempts: {last_result.get('status')}{suffix}")
         return last_result
+
+    async def _refresh_after_cancel_reject(
+        self,
+        instrument: Instrument,
+        order_id: str,
+        correlation_id: str,
+        fallback_status: str,
+        reference_price: float,
+        cancel_error: Exception,
+    ) -> dict[str, Any]:
+        error_message = str(cancel_error)[:800]
+        implied_status = self._cancel_reject_implied_status(cancel_error)
+        detail = await self._order_detail(order_id)
+        detail_status = _broker_order_status(detail, implied_status or fallback_status)
+        status = implied_status or detail_status or fallback_status or "UNKNOWN"
+        fill_details = await self._order_fill_details(
+            order_id,
+            reference_price if status in TRADED_STATUSES else 0,
+        )
+        traded_quantity = int(fill_details.get("traded_quantity") or 0)
+        if implied_status in TRADED_STATUSES and traded_quantity <= 0:
+            status = "TRADED_UNCONFIRMED"
+            error_message = (
+                f"{error_message} | Dhan says order traded, but traded quantity could not be confirmed. "
+                "Retry stopped to avoid duplicate quantity; broker reconcile must repair state."
+            )[:1000]
+            self.event("ERROR", f"{instrument.symbol} order {order_id} traded at broker but quantity is unconfirmed; retry stopped.")
+        elif status in TRADED_STATUSES and traded_quantity > 0:
+            self.event("INFO", f"{instrument.symbol} order {order_id} traded while cancel was being requested; using broker fill and stopping retry.")
+        elif status in FAILED_STATUSES:
+            error_message = f"{error_message} | Broker status after cancel reject: {status}"[:1000]
+        result = {
+            "order_id": order_id,
+            "status": status,
+            "raw_detail": detail,
+            "cancel_error": error_message,
+            "error_message": error_message,
+            "average_price": fill_details.get("average_price") or 0.0,
+            "traded_quantity": traded_quantity,
+        }
+        self._update_ledger_order(
+            correlation_id,
+            {
+                "status": status,
+                "raw_detail": detail,
+                "cancel_error": error_message,
+                "error_message": error_message,
+                "average_price": result["average_price"] or None,
+                "traded_quantity": traded_quantity or None,
+            },
+        )
+        return result
+
+    def _cancel_reject_implied_status(self, exc: Exception) -> str:
+        text = str(exc).lower()
+        if "traded" in text:
+            return "TRADED"
+        if "cancelled" in text or "canceled" in text:
+            return "CANCELLED"
+        return ""
 
     async def _order_detail(self, order_id: str) -> dict[str, Any]:
         if not order_id or order_id.startswith("DRY-"):
