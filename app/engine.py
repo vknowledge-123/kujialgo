@@ -438,6 +438,11 @@ class DhanAlgoEngine:
             applied_quantity = int(record.get("traded_quantity") or record.get("quantity") or 0)
             self._update_ledger_order(correlation_id, {"applied_to_position": True, "applied_quantity": applied_quantity})
 
+    def _mark_order_result_applied(self, order: dict[str, Any]) -> None:
+        correlation_ids = order.get("correlation_ids") or [order.get("correlation_id")]
+        for correlation_id in correlation_ids:
+            self._mark_latest_order_applied(str(correlation_id or ""))
+
     def _update_ledger_order_from_broker(self, row: dict[str, Any], fallback_correlation_id: str = "") -> str:
         correlation_id = _broker_correlation_id(row) or fallback_correlation_id
         if not correlation_id:
@@ -949,7 +954,7 @@ class DhanAlgoEngine:
             meta={"entry_order_status": status, "reason": signal.get("reason"), "sizing": sizing_reason, "requested_quantity": quantity},
         )
         self.positions[position_key] = position
-        self._mark_latest_order_applied(str(order.get("correlation_id") or ""))
+        self._mark_order_result_applied(order)
         self._persist_position(position)
         self.event("ENTRY", f"{instrument.symbol} {signal['strategy']} BUY {executed_quantity} at {entry:.2f}, SL {stop:.2f}, target {target:.2f} ({sizing_reason})")
 
@@ -1111,7 +1116,7 @@ class DhanAlgoEngine:
             },
         )
         self.positions[position_key] = position
-        self._mark_latest_order_applied(str(order.get("correlation_id") or ""))
+        self._mark_order_result_applied(order)
         self._persist_position(position)
         self.event("ENTRY", f"{instrument.symbol} {strategy} {transaction_type} {executed_quantity} at {entry:.2f}, SL {stop:.2f}, target {target:.2f} ({sizing_reason})")
         return True
@@ -1259,7 +1264,7 @@ class DhanAlgoEngine:
                 {"order_id": str(order.get("order_id") or ""), "quantity": executed_quantity, "requested_quantity": initial_quantity, "price": fill_price, "status": status}
             )
             self._refresh_scalper_risk(position)
-            self._mark_latest_order_applied(str(order.get("correlation_id") or ""))
+            self._mark_order_result_applied(order)
             self._persist_position(position)
             self.event("ENTRY", f"{position.symbol} scalper pyramid {transaction_type} add {add_count}/{max_adds}: +{executed_quantity}, total {position.quantity}, avg {position.entry_price:.2f}.")
 
@@ -1302,14 +1307,14 @@ class DhanAlgoEngine:
             position.quantity -= max(0, executed_quantity)
             position.exit_order_id = str(order.get("order_id") or "")
             position.exit_reason = f"PARTIAL_{reason}"
-            self._mark_latest_order_applied(str(order.get("correlation_id") or ""))
+            self._mark_order_result_applied(order)
             self._persist_position(position)
             self.event("WARN", f"{position.symbol} partial exit {reason}: exited {executed_quantity}, remaining {position.quantity}.")
             return
         position.status = "CLOSED"
         position.exit_order_id = str(order.get("order_id") or "")
         position.exit_reason = reason
-        self._mark_latest_order_applied(str(order.get("correlation_id") or ""))
+        self._mark_order_result_applied(order)
         self._persist_position(position)
         self.event("EXIT", f"{position.symbol} exit {reason} at approx {position.last_price or 0:.2f}")
 
@@ -1359,12 +1364,21 @@ class DhanAlgoEngine:
             }
         assert self.client is not None
         last_result: dict[str, Any] = {}
+        requested_total = int(quantity)
+        remaining_quantity = requested_total
+        total_traded = 0
+        total_value = 0.0
+        filled_correlations: list[str] = []
+        order_ids: list[str] = []
         for attempt in range(1, 4):
+            if remaining_quantity <= 0:
+                break
+            attempt_quantity = remaining_quantity
             attempt_correlation_id = f"{correlation_id}{attempt}"[:30]
             self._record_order_intent(
                 instrument,
                 transaction_type,
-                quantity,
+                attempt_quantity,
                 attempt_correlation_id,
                 order_role,
                 position_key,
@@ -1372,7 +1386,7 @@ class DhanAlgoEngine:
                 attempt=attempt,
             )
             try:
-                result = await self.client.place_market_order(instrument.security_id, transaction_type, quantity, attempt_correlation_id)
+                result = await self.client.place_market_order(instrument.security_id, transaction_type, attempt_quantity, attempt_correlation_id)
             except Exception as exc:
                 request_payload = getattr(exc, "request_payload", {})
                 payload_note = ""
@@ -1407,15 +1421,21 @@ class DhanAlgoEngine:
                 await asyncio.sleep(0.25 * attempt)
                 continue
             order_id = str(result.get("orderId") or (result.get("data") or {}).get("orderId") or "")
+            if order_id:
+                order_ids.append(order_id)
             status = str(result.get("orderStatus") or (result.get("data") or {}).get("orderStatus") or "").upper()
             last_result = {
                 "order_id": order_id,
+                "order_ids": order_ids[:],
                 "status": status,
                 "attempts": attempt,
                 "raw": result,
                 "correlation_id": attempt_correlation_id,
+                "correlation_ids": filled_correlations[:],
                 "average_price": 0.0,
                 "traded_quantity": 0,
+                "requested_quantity": requested_total,
+                "remaining_quantity": remaining_quantity,
             }
             self._update_ledger_order(attempt_correlation_id, {"order_id": order_id, "status": status, "raw": result})
             final_status = await self._wait_order_status(order_id, status)
@@ -1423,10 +1443,28 @@ class DhanAlgoEngine:
             details = await self._order_fill_details(order_id, reference_price if final_status in FILL_ACCEPTED_STATUSES else 0)
             last_result.update(details)
             traded_quantity = int(details.get("traded_quantity") or 0)
-            if traded_quantity > 0 and traded_quantity < int(quantity):
+            if final_status in FILL_ACCEPTED_STATUSES and traded_quantity <= 0:
+                last_result["status"] = "TRADED_UNCONFIRMED"
+                last_result["error_message"] = "Broker reported fill status but traded quantity could not be confirmed; retry stopped to avoid duplicate quantity."
+                self._update_ledger_order(
+                    attempt_correlation_id,
+                    {
+                        "status": "TRADED_UNCONFIRMED",
+                        "error_message": last_result["error_message"],
+                    },
+                )
+                return last_result
+            if traded_quantity > 0:
+                fill_price = float(details.get("average_price") or reference_price or 0)
+                total_traded += traded_quantity
+                if fill_price > 0:
+                    total_value += fill_price * traded_quantity
+                filled_correlations.append(attempt_correlation_id)
+                remaining_quantity = max(0, requested_total - total_traded)
+            if traded_quantity > 0 and traded_quantity < int(attempt_quantity):
                 final_status = "PARTIALLY_FILLED"
                 last_result["status"] = final_status
-            elif traded_quantity >= int(quantity) and final_status in PARTIAL_FILL_STATUSES:
+            elif traded_quantity >= int(attempt_quantity) and final_status in PARTIAL_FILL_STATUSES:
                 final_status = "TRADED"
                 last_result["status"] = final_status
             if final_status not in FILL_ACCEPTED_STATUSES:
@@ -1441,12 +1479,28 @@ class DhanAlgoEngine:
                     "status": final_status,
                     "average_price": details.get("average_price") or None,
                     "traded_quantity": details.get("traded_quantity") or None,
+                    "remaining_quantity": max(0, attempt_quantity - traded_quantity),
                     "error_message": last_result.get("error_message") or None,
                 },
             )
-            if final_status in FILL_ACCEPTED_STATUSES:
-                return last_result
-            if order_id and final_status in PENDING_STATUSES:
+            if total_traded >= requested_total:
+                aggregate_price = round(total_value / total_traded, 4) if total_traded > 0 and total_value > 0 else float(reference_price or 0)
+                return {
+                    **last_result,
+                    "order_id": order_ids[-1] if order_ids else order_id,
+                    "order_ids": order_ids[:],
+                    "status": "TRADED",
+                    "attempts": attempt,
+                    "correlation_id": filled_correlations[-1] if filled_correlations else attempt_correlation_id,
+                    "correlation_ids": filled_correlations[:],
+                    "average_price": aggregate_price,
+                    "traded_quantity": total_traded,
+                    "requested_quantity": requested_total,
+                    "remaining_quantity": 0,
+                }
+            if final_status in FILL_ACCEPTED_STATUSES and traded_quantity > 0:
+                self.event("WARN", f"{instrument.symbol} {transaction_type} partially filled {total_traded}/{requested_total}; retrying remaining {remaining_quantity}.")
+            if order_id and (final_status in PENDING_STATUSES or final_status in PARTIAL_FILL_STATUSES):
                 try:
                     await self.client.cancel_order(order_id)
                     self._update_ledger_order(attempt_correlation_id, {"status": "CANCEL_REQUESTED"})
@@ -1463,12 +1517,50 @@ class DhanAlgoEngine:
                     )
                     last_result.update(refreshed)
                     refreshed_status = str(refreshed.get("status") or "").upper()
-                    if refreshed_status in FILL_ACCEPTED_STATUSES:
-                        return last_result
+                    refreshed_traded = int(refreshed.get("traded_quantity") or 0)
+                    additional_traded = max(0, refreshed_traded - traded_quantity)
+                    if additional_traded > 0:
+                        fill_price = float(refreshed.get("average_price") or reference_price or 0)
+                        total_traded += additional_traded
+                        if fill_price > 0:
+                            total_value += fill_price * additional_traded
+                        if attempt_correlation_id not in filled_correlations:
+                            filled_correlations.append(attempt_correlation_id)
+                        remaining_quantity = max(0, requested_total - total_traded)
+                    if total_traded >= requested_total:
+                        aggregate_price = round(total_value / total_traded, 4) if total_traded > 0 and total_value > 0 else float(reference_price or 0)
+                        return {
+                            **last_result,
+                            "order_id": order_ids[-1] if order_ids else order_id,
+                            "order_ids": order_ids[:],
+                            "status": "TRADED",
+                            "attempts": attempt,
+                            "correlation_id": filled_correlations[-1] if filled_correlations else attempt_correlation_id,
+                            "correlation_ids": filled_correlations[:],
+                            "average_price": aggregate_price,
+                            "traded_quantity": total_traded,
+                            "requested_quantity": requested_total,
+                            "remaining_quantity": 0,
+                        }
                     if refreshed_status == "TRADED_UNCONFIRMED":
                         return last_result
                     self.event("WARN", f"Cancel before retry failed for {instrument.symbol}: {exc}")
             await asyncio.sleep(0.25 * attempt)
+        if total_traded > 0:
+            aggregate_price = round(total_value / total_traded, 4) if total_value > 0 else float(reference_price or 0)
+            return {
+                **last_result,
+                "order_id": order_ids[-1] if order_ids else str(last_result.get("order_id") or ""),
+                "order_ids": order_ids[:],
+                "status": "PARTIALLY_FILLED",
+                "attempts": 3,
+                "correlation_id": filled_correlations[-1] if filled_correlations else str(last_result.get("correlation_id") or ""),
+                "correlation_ids": filled_correlations[:],
+                "average_price": aggregate_price,
+                "traded_quantity": total_traded,
+                "requested_quantity": requested_total,
+                "remaining_quantity": max(0, requested_total - total_traded),
+            }
         reason = self._order_failure_reason(last_result)
         suffix = f": {reason}" if reason else ""
         self.event("ERROR", f"{instrument.symbol} {transaction_type} failed after 3 attempts: {last_result.get('status')}{suffix}")
