@@ -664,12 +664,12 @@ class DhanAlgoEngine:
         if self.settings.dry_run:
             self.entries_blocked_until_reconcile = False
         else:
-            self.entries_blocked_until_reconcile = True
+            self.entries_blocked_until_reconcile = False
             self.broker_reconcile_status = {
                 **self.broker_reconcile_status,
                 "running": False,
-                "message": "Startup broker reconcile queued; new entries are blocked until broker reconcile succeeds.",
-                "entries_blocked_until_reconcile": True,
+                "message": "Startup broker reconcile queued in background; trading continues and only mismatched/pending symbols will be locked.",
+                "entries_blocked_until_reconcile": False,
             }
             self.event("INFO", self.broker_reconcile_status["message"])
         self.running = True
@@ -1653,13 +1653,13 @@ class DhanAlgoEngine:
             except asyncio.CancelledError:
                 break
             except asyncio.TimeoutError:
-                self.entries_blocked_until_reconcile = True
+                self.entries_blocked_until_reconcile = False
                 self.broker_reconcile_status = {
                     **self.broker_reconcile_status,
                     "running": False,
-                    "message": f"Broker reconcile timed out after {BROKER_RECONCILE_TIMEOUT_SECONDS:g}s; new entries are blocked until broker reconcile succeeds.",
+                    "message": f"Broker reconcile timed out after {BROKER_RECONCILE_TIMEOUT_SECONDS:g}s; trading continues with existing symbol locks.",
                     "last_run": datetime.now(IST).isoformat(),
-                    "entries_blocked_until_reconcile": True,
+                    "entries_blocked_until_reconcile": False,
                 }
                 self.event("WARN", self.broker_reconcile_status["message"])
             except DhanAuthenticationError as exc:
@@ -1672,11 +1672,11 @@ class DhanAlgoEngine:
                 self.broker_reconcile_status = {
                     **self.broker_reconcile_status,
                     "running": False,
-                    "message": f"Broker reconcile failed: {exc}",
+                    "message": f"Broker reconcile failed: {exc}; trading continues with existing symbol locks.",
                     "last_run": datetime.now(IST).isoformat(),
-                    "entries_blocked_until_reconcile": True,
+                    "entries_blocked_until_reconcile": False,
                 }
-                self.entries_blocked_until_reconcile = True
+                self.entries_blocked_until_reconcile = False
                 self.event("WARN", self.broker_reconcile_status["message"])
             await asyncio.sleep(20)
 

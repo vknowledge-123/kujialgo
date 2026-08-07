@@ -85,16 +85,16 @@ async def broker_reconcile():
     try:
         await asyncio.wait_for(engine.reconcile_broker_state(), timeout=BROKER_RECONCILE_TIMEOUT_SECONDS)
         return engine.snapshot()
-    except asyncio.TimeoutError as exc:
+    except asyncio.TimeoutError:
         message = f"Broker reconcile timed out after {BROKER_RECONCILE_TIMEOUT_SECONDS:g}s."
-        engine.entries_blocked_until_reconcile = True
+        engine.entries_blocked_until_reconcile = False
         engine.broker_reconcile_status = {
             **engine.broker_reconcile_status,
             "running": False,
-            "message": message,
-            "entries_blocked_until_reconcile": True,
+            "message": f"{message} Trading continues with existing symbol locks.",
+            "entries_blocked_until_reconcile": False,
         }
-        engine.event("WARN", message)
-        raise HTTPException(status_code=504, detail=message) from exc
+        engine.event("WARN", engine.broker_reconcile_status["message"])
+        return engine.snapshot()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
