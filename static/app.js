@@ -236,7 +236,7 @@ function renderBrokerAlert(status) {
   alert.classList.remove("hidden");
   const mismatchText = mismatches.map((row) => `${row.symbol}: app ${row.app_qty}, broker ${row.broker_qty}`).join(" | ");
   const pendingText = pending.map((row) => `${row.symbol}: ${row.status} ${row.quantity}`).join(" | ");
-  const blockedFor = locked.length ? locked.join(", ") : "all new entries";
+  const blockedFor = locked.length ? locked.join(", ") : (entriesBlocked ? "all new entries" : "none");
   alert.innerHTML = `
     <strong>Broker/app reconciliation lock active</strong>
     <div>${escapeHtml(status.message || "New entries are blocked until broker reconcile succeeds.")}</div>

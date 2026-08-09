@@ -82,7 +82,7 @@ def _broker_order_id(row: dict[str, Any]) -> str:
 
 def _broker_correlation_id(row: dict[str, Any]) -> str:
     row = row.get("data", row) if isinstance(row.get("data"), dict) else row
-    return str(_broker_value(row, "correlationId", "CorrelationId", "correlation_id") or "")
+    return str(_broker_value(row, "correlationId", "CorrelationId", "CorrelationID", "correlation_id") or "")
 
 
 def _broker_order_status(row: dict[str, Any], fallback: str = "") -> str:
@@ -134,14 +134,51 @@ def _broker_filled_quantity(row: dict[str, Any]) -> int:
     if filled > 0:
         return filled
     requested = _broker_quantity(row, "quantity", "Quantity", "orderQuantity")
-    remaining = _broker_quantity(row, "remainingQuantity", "RemainingQuantity", "remainingQty", "pendingQuantity")
-    if requested > 0 and remaining >= 0 and requested >= remaining:
-        return requested - remaining
+    remaining_value = _broker_value(row, "remainingQuantity", "RemainingQuantity", "remainingQty", "pendingQuantity")
+    if remaining_value not in (None, ""):
+        try:
+            remaining = int(float(remaining_value))
+        except (TypeError, ValueError):
+            remaining = -1
+        if requested > 0 and remaining >= 0 and requested >= remaining:
+            return requested - remaining
     status = _broker_order_status(row)
     average = _broker_price(row, "averageTradedPrice", "AvgTradedPrice", "averagePrice", "tradedPrice", "TradedPrice")
     if status in TRADED_STATUSES and requested > 0 and average > 0:
         return requested
     return 0
+
+
+def _broker_security_id(row: dict[str, Any]) -> str:
+    row = row.get("data", row) if isinstance(row.get("data"), dict) else row
+    return str(_broker_value(row, "securityId", "SecurityId", "security_id") or "")
+
+
+def _broker_product_type(row: dict[str, Any]) -> str:
+    row = row.get("data", row) if isinstance(row.get("data"), dict) else row
+    value = str(_broker_value(row, "productType", "ProductName", "Product", "product_type") or "").upper()
+    if value == "I":
+        return "INTRADAY"
+    if value == "C":
+        return "CNC"
+    if value == "M":
+        return "MARGIN"
+    if value == "F":
+        return "MTF"
+    if value == "V":
+        return "CO"
+    if value == "B":
+        return "BO"
+    return value
+
+
+def _broker_transaction_type(row: dict[str, Any]) -> str:
+    value = str(_broker_value(row, "transactionType", "TxnType", "transaction_type") or "").upper()
+    if value == "B":
+        return "BUY"
+    if value == "S":
+        return "SELL"
+    return value
 
 
 def _json_objects_from_message(message: str | bytes) -> list[Any]:
@@ -448,7 +485,7 @@ class DhanAlgoEngine:
             "order_id": "",
             "symbol": instrument.symbol,
             "security_id": str(instrument.security_id),
-            "transaction_type": transaction_type.upper(),
+            "transaction_type": _broker_transaction_type({"transactionType": transaction_type}),
             "quantity": int(quantity),
             "order_role": order_role.upper(),
             "position_key": position_key,
@@ -501,14 +538,18 @@ class DhanAlgoEngine:
             requested_quantity = int(((self.ledger.get("orders") or {}).get(correlation_id) or {}).get("quantity") or 0)
         if traded_quantity > 0 and requested_quantity > 0 and traded_quantity < requested_quantity:
             status = "PARTIALLY_FILLED"
+        broker_error = self._extract_error_message(row) if status in FAILED_STATUSES else ""
         self._update_ledger_order(
             correlation_id,
             {
                 "order_id": _broker_order_id(row) or None,
                 "status": status or None,
+                "security_id": _broker_security_id(row) or None,
+                "transaction_type": _broker_transaction_type(row) or None,
                 "average_price": average_price or None,
                 "traded_quantity": traded_quantity or None,
                 "remaining_quantity": max(0, requested_quantity - traded_quantity) if requested_quantity else None,
+                "error_message": broker_error or None,
                 "raw": row,
             },
         )
@@ -554,6 +595,7 @@ class DhanAlgoEngine:
                 payload.get("rejectionReason"),
                 payload.get("omsErrorDescription"),
                 payload.get("omsErrorCode"),
+                payload.get("ReasonDescription"),
                 payload.get("reason"),
                 payload.get("error"),
             ]
@@ -567,6 +609,7 @@ class DhanAlgoEngine:
                         nested.get("rejectionReason"),
                         nested.get("omsErrorDescription"),
                         nested.get("omsErrorCode"),
+                        nested.get("ReasonDescription"),
                         nested.get("reason"),
                     ]
                 )
@@ -2104,7 +2147,7 @@ class DhanAlgoEngine:
                     "order_id": str(record.get("order_id") or ""),
                     "correlation_id": str(record.get("correlation_id") or ""),
                     "status": str(record.get("status") or "PENDING_ORDER").upper(),
-                    "transaction_type": str(record.get("transaction_type") or ""),
+                    "transaction_type": _broker_transaction_type({"transactionType": record.get("transaction_type")}),
                     "quantity": int(record.get("quantity") or 0),
                 }
             )
@@ -2285,7 +2328,7 @@ class DhanAlgoEngine:
         if position_key in self.positions and self.positions[position_key].status == "OPEN":
             return
         payload = metadata.get("position") or {}
-        side = str(payload.get("side") or ("SHORT" if record.get("transaction_type") == "SELL" else "LONG")).upper()
+        side = str(payload.get("side") or ("SHORT" if _broker_transaction_type(record) == "SELL" else "LONG")).upper()
         symbol = str(record.get("symbol") or payload.get("symbol") or "")
         entry = float(fill_price or payload.get("entry_price") or 0)
         stop = float(payload.get("stop_loss") or 0)
@@ -2329,10 +2372,10 @@ class DhanAlgoEngine:
     def _broker_net_quantities(self, rows: list[dict[str, Any]]) -> dict[str, int]:
         broker_net: dict[str, int] = {}
         for row in rows:
-            security_id = str(row.get("securityId") or row.get("security_id") or "")
+            security_id = _broker_security_id(row)
             if not security_id:
                 continue
-            product_type = str(row.get("productType") or "").upper()
+            product_type = _broker_product_type(row)
             if product_type and product_type != "INTRADAY":
                 continue
             net_qty = _broker_quantity(row, "netQty", "netQuantity")
@@ -2343,10 +2386,10 @@ class DhanAlgoEngine:
     def _broker_position_details(self, rows: list[dict[str, Any]]) -> dict[str, dict[str, Any]]:
         details: dict[str, dict[str, Any]] = {}
         for row in rows:
-            security_id = str(row.get("securityId") or row.get("security_id") or "")
+            security_id = _broker_security_id(row)
             if not security_id:
                 continue
-            product_type = str(row.get("productType") or "").upper()
+            product_type = _broker_product_type(row)
             if product_type and product_type != "INTRADAY":
                 continue
             net_qty = _broker_quantity(row, "netQty", "netQuantity")
@@ -2497,7 +2540,7 @@ class DhanAlgoEngine:
         failed = []
         for row in order_book:
             correlation_id = _broker_correlation_id(row)
-            security_id = str(row.get("securityId") or row.get("security_id") or "")
+            security_id = _broker_security_id(row)
             if correlation_id not in ledger_correlations and security_id not in relevant_security_ids:
                 continue
             status = _broker_order_status(row)
@@ -2507,7 +2550,7 @@ class DhanAlgoEngine:
                 "order_id": _broker_order_id(row),
                 "correlation_id": correlation_id,
                 "status": status,
-                "transaction_type": str(row.get("transactionType") or ""),
+                "transaction_type": _broker_transaction_type(row),
                 "quantity": _broker_quantity(row, "quantity"),
             }
             if status in PENDING_STATUSES or status in PENDING_LEDGER_STATUSES:
