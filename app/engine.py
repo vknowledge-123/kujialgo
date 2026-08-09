@@ -77,23 +77,37 @@ def _as_list_payload(data: Any) -> list[dict[str, Any]]:
 
 def _broker_order_id(row: dict[str, Any]) -> str:
     row = row.get("data", row) if isinstance(row.get("data"), dict) else row
-    return str(row.get("orderId") or row.get("OrderNo") or row.get("OrderId") or row.get("order_id") or "")
+    return str(_broker_value(row, "orderId", "OrderNo", "OrderId", "orderNo", "order_id") or "")
 
 
 def _broker_correlation_id(row: dict[str, Any]) -> str:
     row = row.get("data", row) if isinstance(row.get("data"), dict) else row
-    return str(row.get("correlationId") or row.get("CorrelationId") or row.get("correlation_id") or "")
+    return str(_broker_value(row, "correlationId", "CorrelationId", "correlation_id") or "")
 
 
 def _broker_order_status(row: dict[str, Any], fallback: str = "") -> str:
     row = row.get("data", row) if isinstance(row.get("data"), dict) else row
-    return str(row.get("orderStatus") or row.get("Status") or row.get("OrderStatus") or fallback or "").upper()
+    return str(_broker_value(row, "orderStatus", "Status", "OrderStatus", "status") or fallback or "").upper()
+
+
+def _broker_value(row: dict[str, Any], *keys: str) -> Any:
+    row = row.get("data", row) if isinstance(row.get("data"), dict) else row
+    for key in keys:
+        value = row.get(key)
+        if value not in (None, ""):
+            return value
+    lowered = {str(key).lower(): value for key, value in row.items()}
+    for key in keys:
+        value = lowered.get(str(key).lower())
+        if value not in (None, ""):
+            return value
+    return None
 
 
 def _broker_quantity(row: dict[str, Any], *keys: str) -> int:
     row = row.get("data", row) if isinstance(row.get("data"), dict) else row
     for key in keys:
-        value = row.get(key)
+        value = _broker_value(row, key)
         if value not in (None, ""):
             try:
                 return int(float(value))
@@ -105,7 +119,7 @@ def _broker_quantity(row: dict[str, Any], *keys: str) -> int:
 def _broker_price(row: dict[str, Any], *keys: str) -> float:
     row = row.get("data", row) if isinstance(row.get("data"), dict) else row
     for key in keys:
-        value = row.get(key)
+        value = _broker_value(row, key)
         if value not in (None, ""):
             try:
                 return float(value)
@@ -116,15 +130,15 @@ def _broker_price(row: dict[str, Any], *keys: str) -> float:
 
 def _broker_filled_quantity(row: dict[str, Any]) -> int:
     row = row.get("data", row) if isinstance(row.get("data"), dict) else row
-    filled = _broker_quantity(row, "filledQty", "filledQuantity", "tradedQuantity", "tradedQty")
+    filled = _broker_quantity(row, "filledQty", "filledQuantity", "tradedQuantity", "tradedQty", "TradedQty")
     if filled > 0:
         return filled
-    requested = _broker_quantity(row, "quantity", "orderQuantity")
-    remaining = _broker_quantity(row, "remainingQuantity", "remainingQty", "pendingQuantity")
+    requested = _broker_quantity(row, "quantity", "Quantity", "orderQuantity")
+    remaining = _broker_quantity(row, "remainingQuantity", "RemainingQuantity", "remainingQty", "pendingQuantity")
     if requested > 0 and remaining >= 0 and requested >= remaining:
         return requested - remaining
     status = _broker_order_status(row)
-    average = _broker_price(row, "averageTradedPrice", "averagePrice", "tradedPrice")
+    average = _broker_price(row, "averageTradedPrice", "AvgTradedPrice", "averagePrice", "tradedPrice", "TradedPrice")
     if status in TRADED_STATUSES and requested > 0 and average > 0:
         return requested
     return 0
@@ -504,9 +518,11 @@ class DhanAlgoEngine:
         return _broker_price(
             row,
             "averageTradedPrice",
+            "AvgTradedPrice",
             "averagePrice",
             "avgPrice",
             "tradedPrice",
+            "TradedPrice",
             "price",
             "buyAvg",
             "sellAvg",
@@ -1799,18 +1815,22 @@ class DhanAlgoEngine:
 
     async def _order_update_worker(self) -> None:
         while self.running and self.credentials.get("client_id") and self.credentials.get("access_token"):
+            connected_at = 0.0
             try:
                 async with websockets.connect(
                     DHAN_ORDER_UPDATE_URL,
-                    ping_interval=None,
+                    ping_interval=20,
+                    ping_timeout=10,
                     open_timeout=10,
-                    close_timeout=1,
+                    close_timeout=3,
                 ) as ws:
+                    connected_at = time.monotonic()
                     await ws.send(json.dumps({"LoginReq": {"MsgCode": 42, "ClientId": self.credentials["client_id"], "Token": self.credentials["access_token"]}, "UserType": "SELF"}))
                     self.order_connected = True
                     self.order_last_error = ""
-                    self.order_reconnects = 0
                     async for message in ws:
+                        if self.order_reconnects and time.monotonic() - connected_at >= 30:
+                            self.order_reconnects = 0
                         for payload in _json_objects_from_message(message):
                             if not isinstance(payload, dict):
                                 continue
@@ -1820,10 +1840,11 @@ class DhanAlgoEngine:
                             data = payload.get("Data") or payload.get("data") or payload
                             if not isinstance(data, dict):
                                 continue
-                            order_no = str(data.get("OrderNo") or data.get("orderId") or data.get("OrderId") or "")
+                            order_no = _broker_order_id(data)
                             if order_no:
                                 self.order_updates[order_no] = data
                                 self._update_ledger_order_from_broker(data)
+                    raise RuntimeError("order update socket closed by server")
             except asyncio.CancelledError:
                 break
             except DhanAuthenticationError as exc:
@@ -1834,6 +1855,8 @@ class DhanAlgoEngine:
                     self._handle_auth_failure("Dhan order WebSocket", exc)
                     break
                 self.order_connected = False
+                if connected_at and time.monotonic() - connected_at >= 30:
+                    self.order_reconnects = 0
                 self.order_reconnects += 1
                 self.order_last_error = f"Order update socket reconnecting: {exc}"
                 if self.order_reconnects == 1 or self.order_reconnects % 10 == 0:
