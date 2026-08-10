@@ -1216,6 +1216,7 @@ class DhanAlgoEngine:
                 "high": 0.0,
                 "low": 0.0,
                 "ready": False,
+                "ready_logged": False,
                 "long_triggered": False,
                 "short_triggered": False,
                 "mode": "opening_range",
@@ -1242,6 +1243,9 @@ class DhanAlgoEngine:
             state["low"] = low
             state["ready"] = True
             state["ready_at"] = timestamp.isoformat()
+            if not state.get("ready_logged"):
+                self.event("INFO", f"{symbol} scalper ready | high {high:.2f} | low {low:.2f} | mode {state.get('mode') or 'opening_range'}")
+                state["ready_logged"] = True
             return state
         return state
 
