@@ -387,6 +387,9 @@ class DhanAlgoEngine:
         self.external_locked_symbols: set[str] = set()
         self.last_external_state_load = 0.0
         self.last_reconciled_candle_load = ""
+        self.premarket_cache_data: dict[str, Any] = {"symbols": {}, "sectors": {}, "errors": {}}
+        self.premarket_cache_mtime = 0.0
+        self.premarket_cache_checked_at = 0.0
         self.entries_blocked_until_reconcile = False
         self.broker_positions: dict[str, dict[str, Any]] = {}
         self.broker_reconcile_status: dict[str, Any] = {
@@ -2955,12 +2958,28 @@ class DhanAlgoEngine:
         return result
 
     def _previous_day(self, symbol: str) -> dict[str, float]:
-        cache = read_json(PREMARKET_FILE, {"symbols": {}})
+        cache = self._premarket_cache()
         return ((cache.get("symbols") or {}).get(symbol) or {}).get("previous_day") or {}
 
     def _baseline(self, symbol: str, timeframe: int) -> list[int]:
-        cache = read_json(PREMARKET_FILE, {"symbols": {}})
+        cache = self._premarket_cache()
         return (((cache.get("symbols") or {}).get(symbol) or {}).get("baseline") or {}).get(str(timeframe)) or []
+
+    def _premarket_cache(self, max_age_seconds: float = 5.0) -> dict[str, Any]:
+        now = time.monotonic()
+        if now - self.premarket_cache_checked_at < max_age_seconds:
+            return self.premarket_cache_data
+        self.premarket_cache_checked_at = now
+        try:
+            mtime = PREMARKET_FILE.stat().st_mtime
+        except OSError:
+            self.premarket_cache_data = {"symbols": {}, "sectors": {}, "errors": {}}
+            self.premarket_cache_mtime = 0.0
+            return self.premarket_cache_data
+        if mtime != self.premarket_cache_mtime:
+            self.premarket_cache_data = read_json(PREMARKET_FILE, {"symbols": {}, "sectors": {}, "errors": {}})
+            self.premarket_cache_mtime = mtime
+        return self.premarket_cache_data
 
     def _premarket_cache_summary_snapshot(self) -> dict[str, Any]:
         universe = sorted(self.universe_symbols or set(self.long_symbols + self.short_symbols))
@@ -2968,7 +2987,7 @@ class DhanAlgoEngine:
             resolved, _missing = self.resolver.resolve(universe)
         else:
             resolved = list(self.instruments_by_symbol.values())
-        cache = read_json(PREMARKET_FILE, {"symbols": {}, "sectors": {}, "errors": {}})
+        cache = self._premarket_cache()
         today_key = datetime.now(IST).date().isoformat()
         return _premarket_cache_summary(
             cache,
@@ -3020,7 +3039,7 @@ class DhanAlgoEngine:
         )
 
     def _previous_sector_day(self, sector: str) -> dict[str, float]:
-        cache = read_json(PREMARKET_FILE, {"sectors": {}})
+        cache = self._premarket_cache()
         return ((cache.get("sectors") or {}).get(sector) or {}).get("previous_day") or {}
 
     def _on_sector_tick(self, security_id: str, price: float, timestamp: datetime) -> None:
@@ -3060,7 +3079,7 @@ class DhanAlgoEngine:
 
     def sector_rankings(self) -> list[dict[str, Any]]:
         rows = []
-        cache = read_json(PREMARKET_FILE, {"sectors": {}})
+        cache = self._premarket_cache()
         cached = cache.get("sectors") or {}
         for sector_name, instrument in self.sector_instruments.items():
             live = self.sector_live.get(sector_name) or {}
@@ -3136,7 +3155,7 @@ class DhanAlgoEngine:
                     }
                 )
             premarket = dict(self.premarket_status)
-            if not premarket.get("running"):
+            if self.enable_reconcile_workers and not premarket.get("running"):
                 premarket["summary"] = self._premarket_cache_summary_snapshot()
             return {
                 "running": self.running,
