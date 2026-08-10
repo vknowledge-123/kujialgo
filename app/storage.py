@@ -30,3 +30,27 @@ def write_json(path: Path, payload: Any) -> None:
     with _LOCK:
         tmp.write_text(data, encoding="utf-8")
         tmp.replace(path)
+
+
+def append_jsonl(path: Path, payload: Any) -> None:
+    ensure_data_dir()
+    line = json.dumps(payload, ensure_ascii=True, sort_keys=True)
+    with _LOCK:
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write(line + "\n")
+
+
+def read_jsonl(path: Path) -> list[Any]:
+    ensure_data_dir()
+    if not path.exists():
+        return []
+    rows = []
+    with _LOCK:
+        for line in path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            if not line.strip():
+                continue
+            try:
+                rows.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return rows

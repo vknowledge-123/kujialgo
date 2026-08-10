@@ -1,0 +1,16 @@
+[Unit]
+Description=Koju Dhan Algo Trading Engine Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=koju
+Group=koju
+WorkingDirectory=/opt/kujialgo
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/kujialgo/.venv/bin/python -m app.engine_service
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

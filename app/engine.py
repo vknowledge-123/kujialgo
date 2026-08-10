@@ -32,6 +32,8 @@ from .config import (
     ORDER_SOCKET_RECONNECT_MAX_SECONDS,
     PREMARKET_FILE,
     PREMARKET_REPORT_FILE,
+    RECONCILED_CANDLES_FILE,
+    RECONCILE_SNAPSHOT_FILE,
     STATE_FILE,
     TICK_QUEUE_MAXSIZE,
     TICK_QUEUE_WARN_INTERVAL_SECONDS,
@@ -328,7 +330,9 @@ def _premarket_cache_summary(
 
 
 class DhanAlgoEngine:
-    def __init__(self):
+    def __init__(self, enable_reconcile_workers: bool = True, enable_snapshot_worker: bool = True):
+        self.enable_reconcile_workers = enable_reconcile_workers
+        self.enable_snapshot_worker = enable_snapshot_worker
         self.resolver = InstrumentResolver()
         self.client: DhanClient | None = None
         self.settings = StrategySettings()
@@ -380,6 +384,9 @@ class DhanAlgoEngine:
         self.reconciled_day_history: set[str] = set()
         self.ledger: dict[str, Any] = _empty_ledger()
         self.locked_symbols: set[str] = set()
+        self.external_locked_symbols: set[str] = set()
+        self.last_external_state_load = 0.0
+        self.last_reconciled_candle_load = ""
         self.entries_blocked_until_reconcile = False
         self.broker_positions: dict[str, dict[str, Any]] = {}
         self.broker_reconcile_status: dict[str, Any] = {
@@ -457,7 +464,7 @@ class DhanAlgoEngine:
                 )
             except (TypeError, ValueError):
                 continue
-        self.positions.update(loaded)
+        self.positions = loaded
 
     def _position_key(self, symbol: str, side: str) -> str:
         return f"{symbol}:{side.upper()}"
@@ -578,14 +585,55 @@ class DhanAlgoEngine:
         )
 
     def _is_symbol_locked(self, symbol: str) -> bool:
-        return self.entries_blocked_until_reconcile or symbol in self.locked_symbols
+        self._refresh_external_worker_state()
+        return self.entries_blocked_until_reconcile or symbol in self.locked_symbols or symbol in self.external_locked_symbols
 
     def _entry_block_reason(self, symbol: str) -> str:
         if self.entries_blocked_until_reconcile:
             return "broker reconciliation is pending"
-        if symbol in self.locked_symbols:
+        if symbol in self.locked_symbols or symbol in self.external_locked_symbols:
             return "broker/app quantity mismatch is locked"
         return ""
+
+    def _refresh_external_worker_state(self) -> None:
+        if self.enable_reconcile_workers:
+            return
+        now = time.monotonic()
+        if now - self.last_external_state_load < 1:
+            return
+        self.last_external_state_load = now
+        snapshot = read_json(RECONCILE_SNAPSHOT_FILE, {})
+        if isinstance(snapshot, dict):
+            self.external_locked_symbols = set(snapshot.get("locked_symbols") or [])
+            broker = snapshot.get("broker_reconcile")
+            if isinstance(broker, dict):
+                self.broker_reconcile_status = broker
+            reconcile = snapshot.get("reconcile")
+            if isinstance(reconcile, dict):
+                self.reconcile_status = reconcile
+            premarket = snapshot.get("premarket")
+            if isinstance(premarket, dict):
+                self.premarket_status = premarket
+        self._load_reconciled_candles()
+
+    def _load_reconciled_candles(self) -> None:
+        payload = read_json(RECONCILED_CANDLES_FILE, {})
+        if not isinstance(payload, dict):
+            return
+        updated_at = str(payload.get("updated_at") or "")
+        if not updated_at or updated_at == self.last_reconciled_candle_load:
+            return
+        instruments = self.instruments_by_symbol
+        rows_by_symbol = payload.get("symbols") or {}
+        for symbol, frames in rows_by_symbol.items():
+            instrument = instruments.get(normalize_symbol(symbol))
+            if not instrument or not isinstance(frames, dict):
+                continue
+            for timeframe in (1, 5):
+                rows = frames.get(str(timeframe)) or []
+                if rows:
+                    self.candles.seed_history(instrument, timeframe, rows)
+        self.last_reconciled_candle_load = updated_at
 
     def _extract_error_message(self, payload: Any) -> str:
         if payload is None:
@@ -810,10 +858,12 @@ class DhanAlgoEngine:
         self.tick_task = asyncio.create_task(self._tick_worker())
         self.execution_tasks = {asyncio.create_task(self._execution_worker()) for _ in range(max(1, EXECUTION_WORKER_COUNT))}
         self.execution_task = next(iter(self.execution_tasks))
-        self.snapshot_task = asyncio.create_task(self._snapshot_worker())
+        if self.enable_snapshot_worker:
+            self.snapshot_task = asyncio.create_task(self._snapshot_worker())
         self.order_task = asyncio.create_task(self._order_update_worker())
-        self.reconcile_task = asyncio.create_task(self._auto_reconcile_worker())
-        self.broker_reconcile_task = asyncio.create_task(self._broker_reconcile_worker())
+        if self.enable_reconcile_workers:
+            self.reconcile_task = asyncio.create_task(self._auto_reconcile_worker())
+            self.broker_reconcile_task = asyncio.create_task(self._broker_reconcile_worker())
         self._start_market_feed_threads(self.feed_generation)
         self.event("INFO", f"Algo started with {len(self.instruments_by_symbol)} stocks and {len(self.sector_instruments)} sector indexes on {self.settings.timeframe}m.")
         return self.snapshot(fresh=True)
@@ -3068,6 +3118,8 @@ class DhanAlgoEngine:
 
     def _build_snapshot(self) -> dict[str, Any]:
         with self.lock:
+            self._refresh_external_worker_state()
+            effective_locks = sorted(self.locked_symbols | self.external_locked_symbols)
             symbols = sorted(self.instruments_by_symbol)
             latest = []
             for symbol in symbols:
@@ -3080,7 +3132,7 @@ class DhanAlgoEngine:
                         "price": self.candles.latest_price(symbol),
                         "candles_1m": len(self.candles.closed_candles(symbol, 1)),
                         "candles_5m": len(self.candles.closed_candles(symbol, 5)),
-                        "locked": symbol in self.locked_symbols,
+                        "locked": symbol in effective_locks,
                     }
                 )
             premarket = dict(self.premarket_status)
@@ -3119,7 +3171,7 @@ class DhanAlgoEngine:
                 "premarket": premarket,
                 "reconcile": self.reconcile_status,
                 "broker_reconcile": self.broker_reconcile_status,
-                "locked_symbols": sorted(self.locked_symbols),
+                "locked_symbols": effective_locks,
                 "entries_blocked_until_reconcile": self.entries_blocked_until_reconcile,
                 "ledger_file": str(TRADE_LEDGER_FILE),
             }

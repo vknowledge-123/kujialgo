@@ -1,18 +1,16 @@
-import asyncio
-
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 
-from .config import BROKER_RECONCILE_TIMEOUT_SECONDS, START_API_TIMEOUT_SECONDS
-from .engine import DhanAlgoEngine
+from .control import queue_command, read_status_snapshot, save_runtime_config
+from .storage import read_json
+from .config import PREMARKET_REPORT_FILE
 from .symbols import extract_symbols
 
-app = FastAPI(title="Koju Dhan Algo")
+app = FastAPI(title="Koju Dhan Algo API")
 app.mount("/static", StaticFiles(directory="static"), name="static")
 templates = Jinja2Templates(directory="templates")
-engine = DhanAlgoEngine()
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -22,48 +20,67 @@ def dashboard(request: Request):
 
 @app.get("/api/status")
 def status():
-    return engine.snapshot()
+    return read_status_snapshot()
 
 
 @app.post("/api/config")
 def configure(payload: dict = Body(...)):
     try:
-        return engine.configure(payload)
+        save_runtime_config(payload)
+        queue_command("engine", "config", payload)
+        queue_command("reconcile", "config", payload)
+        return read_status_snapshot()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/start")
-async def start_algo(payload: dict = Body(default={})):
-    if payload:
-        engine.configure(payload)
+def start_algo(payload: dict = Body(default={})):
     try:
-        return await asyncio.wait_for(engine.start(), timeout=START_API_TIMEOUT_SECONDS)
-    except asyncio.TimeoutError as exc:
-        message = f"Start request timed out after {START_API_TIMEOUT_SECONDS:g}s."
-        engine.last_error = message
-        engine.event("ERROR", message)
-        raise HTTPException(status_code=504, detail=message) from exc
+        if payload:
+            save_runtime_config(payload)
+            queue_command("reconcile", "config", payload)
+        queue_command("engine", "start", payload)
+        snapshot = read_status_snapshot()
+        snapshot["running"] = True
+        snapshot["market_connecting"] = not bool(snapshot.get("market_connected"))
+        snapshot["order_connecting"] = not bool(snapshot.get("order_connected"))
+        snapshot["last_error"] = ""
+        snapshot.setdefault("events", []).insert(0, {"kind": "INFO", "message": "Start command queued for engine service.", "time": ""})
+        return snapshot
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.post("/api/stop")
-async def stop_algo():
-    return await engine.stop()
+def stop_algo():
+    queue_command("engine", "stop", {})
+    snapshot = read_status_snapshot()
+    snapshot["running"] = False
+    snapshot["market_connected"] = False
+    snapshot["market_connecting"] = False
+    snapshot["order_connected"] = False
+    snapshot["order_connecting"] = False
+    return snapshot
 
 
 @app.post("/api/premarket-cache")
-async def premarket_cache(payload: dict = Body(default={})):
-    if payload:
-        engine.configure(payload)
-    await engine.run_premarket_cache(force=bool(payload.get("force", False)))
-    return engine.snapshot(fresh=True)
+def premarket_cache(payload: dict = Body(default={})):
+    try:
+        if payload:
+            save_runtime_config(payload)
+            queue_command("engine", "config", payload)
+        queue_command("reconcile", "premarket-cache", payload)
+        snapshot = read_status_snapshot()
+        snapshot.setdefault("premarket", {})["message"] = "Premarket cache command queued for reconcile service."
+        return snapshot
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/premarket-report")
 def premarket_report():
-    return engine.premarket_report()
+    return read_json(PREMARKET_REPORT_FILE, {"message": "Report not started", "summary": {}})
 
 
 @app.post("/api/extract-symbols")
@@ -72,28 +89,14 @@ def parse_symbols(payload: dict = Body(...)):
 
 
 @app.post("/api/reconcile/{symbol}")
-async def reconcile(symbol: str):
-    try:
-        return await engine.reconcile_missing_candles(symbol)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+def reconcile(symbol: str):
+    queue_command("reconcile", "reconcile-symbol", {"symbol": symbol})
+    return {"queued": True, "symbol": symbol}
 
 
 @app.post("/api/broker-reconcile")
-async def broker_reconcile():
-    try:
-        await asyncio.wait_for(engine.reconcile_broker_state(), timeout=BROKER_RECONCILE_TIMEOUT_SECONDS)
-        return engine.snapshot(fresh=True)
-    except asyncio.TimeoutError:
-        message = f"Broker reconcile timed out after {BROKER_RECONCILE_TIMEOUT_SECONDS:g}s."
-        engine.entries_blocked_until_reconcile = False
-        engine.broker_reconcile_status = {
-            **engine.broker_reconcile_status,
-            "running": False,
-            "message": f"{message} Trading continues with existing symbol locks.",
-            "entries_blocked_until_reconcile": False,
-        }
-        engine.event("WARN", engine.broker_reconcile_status["message"])
-        return engine.snapshot(fresh=True)
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+def broker_reconcile():
+    queue_command("reconcile", "broker-reconcile", {})
+    snapshot = read_status_snapshot()
+    snapshot.setdefault("broker_reconcile", {})["message"] = "Broker reconcile command queued for reconcile service."
+    return snapshot
