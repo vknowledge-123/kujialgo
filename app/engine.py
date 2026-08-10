@@ -336,7 +336,9 @@ class DhanAlgoEngine:
         self.long_evaluator = LongStrategyEvaluator()
         self.running = False
         self.market_connected = False
+        self.market_connecting = False
         self.order_connected = False
+        self.order_connecting = False
         self.order_last_error = ""
         self.order_reconnects = 0
         self.last_error = ""
@@ -688,7 +690,9 @@ class DhanAlgoEngine:
         self.entries_blocked_until_reconcile = True
         self.client = None
         self.market_connected = False
+        self.market_connecting = False
         self.order_connected = False
+        self.order_connecting = False
         self.reconcile_status = {
             "running": False,
             "message": self.last_error,
@@ -800,6 +804,9 @@ class DhanAlgoEngine:
         self.scalper_state = {}
         self.reconciled_day_history = set()
         self.feed_generation += 1
+        self.market_connecting = True
+        self.order_connecting = True
+        self.order_last_error = ""
         self.tick_task = asyncio.create_task(self._tick_worker())
         self.execution_tasks = {asyncio.create_task(self._execution_worker()) for _ in range(max(1, EXECUTION_WORKER_COUNT))}
         self.execution_task = next(iter(self.execution_tasks))
@@ -815,7 +822,9 @@ class DhanAlgoEngine:
         self.running = False
         self.feed_generation += 1
         self.market_connected = False
+        self.market_connecting = False
         self.order_connected = False
+        self.order_connecting = False
         self._close_market_feed_sockets()
         for task in (self.tick_task, self.order_task, self.execution_task, self.snapshot_task, self.reconcile_task, self.broker_reconcile_task, *list(self.execution_tasks), *list(self.action_tasks)):
             if task:
@@ -837,6 +846,7 @@ class DhanAlgoEngine:
             return
         self.feed_generation += 1
         self.market_connected = False
+        self.market_connecting = True
         self._close_market_feed_sockets()
         self._start_market_feed_threads(self.feed_generation)
         self.event("INFO", f"Market feed resubscribed with {len(self.instruments_by_symbol)} stocks and {len(self.sector_instruments)} sector indexes.")
@@ -877,7 +887,9 @@ class DhanAlgoEngine:
 
         def on_open(ws):
             self.market_connected = True
+            self.market_connecting = False
             self.last_error = ""
+            self.event("INFO", f"Dhan market WebSocket connected with {len(instruments)} instruments.")
             for batch in chunked(instruments, MAX_SUBSCRIBE_BATCH):
                 ws.send(json.dumps({"RequestCode": 17, "InstrumentCount": len(batch), "InstrumentList": batch}))
 
@@ -893,15 +905,20 @@ class DhanAlgoEngine:
 
         def on_error(_ws, error):
             self.market_connected = False
+            self.market_connecting = False
             self.last_error = f"Dhan market WebSocket error: {error}"
+            self.event("WARN", self.last_error)
 
         def on_close(_ws, code, reason):
             self.market_connected = False
+            self.market_connecting = False
             if generation == self.feed_generation and self.running:
                 self.last_error = f"Dhan market WebSocket closed: {code or ''} {reason or ''}".strip()
+                self.event("WARN", self.last_error)
 
         backoff = 2
         while generation == self.feed_generation and self.running:
+            self.market_connecting = True
             ws = websocket_module.WebSocketApp(url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
             with self.lock:
                 self.feed_sockets.append(ws)
@@ -909,7 +926,9 @@ class DhanAlgoEngine:
                 ws.run_forever(ping_interval=20, ping_timeout=10)
             except Exception as exc:
                 self.market_connected = False
+                self.market_connecting = False
                 self.last_error = f"Dhan market WebSocket stopped: {exc}"
+                self.event("WARN", self.last_error)
             finally:
                 with self.lock:
                     if ws in self.feed_sockets:
@@ -1865,6 +1884,7 @@ class DhanAlgoEngine:
     async def _order_update_worker(self) -> None:
         while self.running and self.credentials.get("client_id") and self.credentials.get("access_token"):
             connected_at = 0.0
+            self.order_connecting = True
             try:
                 connect_kwargs = {
                     "ping_interval": ORDER_SOCKET_PING_INTERVAL_SECONDS,
@@ -1881,7 +1901,9 @@ class DhanAlgoEngine:
                     connected_at = time.monotonic()
                     await ws.send(json.dumps({"LoginReq": {"MsgCode": 42, "ClientId": self.credentials["client_id"], "Token": self.credentials["access_token"]}, "UserType": "SELF"}))
                     self.order_connected = True
+                    self.order_connecting = False
                     self.order_last_error = ""
+                    self.event("INFO", "Dhan order update WebSocket connected.")
                     async for message in ws:
                         if self.order_reconnects and time.monotonic() - connected_at >= 30:
                             self.order_reconnects = 0
@@ -1902,9 +1924,11 @@ class DhanAlgoEngine:
             except asyncio.CancelledError:
                 break
             except DhanAuthenticationError as exc:
+                self.order_connecting = False
                 self._handle_auth_failure("Dhan order WebSocket", exc)
                 break
             except Exception as exc:
+                self.order_connecting = False
                 if _is_auth_error(exc):
                     self._handle_auth_failure("Dhan order WebSocket", exc)
                     break
@@ -1916,6 +1940,7 @@ class DhanAlgoEngine:
                 if self.order_reconnects == 1 or self.order_reconnects % 10 == 0:
                     self.event("INFO", self.order_last_error)
                 await asyncio.sleep(min(ORDER_SOCKET_RECONNECT_MAX_SECONDS, ORDER_SOCKET_RECONNECT_BASE_SECONDS + self.order_reconnects))
+        self.order_connecting = False
 
     async def _broker_reconcile_worker(self) -> None:
         while self.running:
@@ -3064,7 +3089,9 @@ class DhanAlgoEngine:
             return {
                 "running": self.running,
                 "market_connected": self.market_connected,
+                "market_connecting": self.market_connecting,
                 "order_connected": self.order_connected,
+                "order_connecting": self.order_connecting,
                 "order_last_error": self.order_last_error,
                 "order_reconnects": self.order_reconnects,
                 "last_error": self.last_error,

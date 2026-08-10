@@ -137,11 +137,13 @@ function render(data) {
   try {
   $("runState").textContent = data.running ? "Running" : "Stopped";
   $("runState").className = data.running ? "pill" : "pill bad";
-  $("feedState").textContent = data.market_connected ? "Feed Live" : "Feed Off";
-  $("feedState").className = data.market_connected ? "pill" : "pill muted";
+  const feedConnecting = Boolean(data.market_connecting);
+  $("feedState").textContent = data.market_connected ? "Feed Live" : (feedConnecting ? "Feed Connecting" : "Feed Off");
+  $("feedState").className = data.market_connected ? "pill" : (feedConnecting ? "pill warn" : "pill muted");
   const orderFallback = Boolean(data.order_last_error && String(data.order_last_error).includes("fallback"));
-  $("orderState").textContent = data.order_connected ? "Orders Live" : (orderFallback ? "Orders Fallback" : (data.order_last_error ? "Orders Reconnecting" : "Orders Off"));
-  $("orderState").className = data.order_connected ? "pill" : (orderFallback ? "pill warn" : "pill muted");
+  const orderConnecting = Boolean(data.order_connecting);
+  $("orderState").textContent = data.order_connected ? "Orders Live" : (orderConnecting ? "Orders Connecting" : (orderFallback ? "Orders Fallback" : (data.order_last_error ? "Orders Reconnecting" : "Orders Off")));
+  $("orderState").className = data.order_connected ? "pill" : ((orderConnecting || orderFallback) ? "pill warn" : "pill muted");
   renderBrokerAlert(data.broker_reconcile || {});
 
   $("positions").innerHTML = (data.positions || []).map((p) => `
