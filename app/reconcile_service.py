@@ -18,14 +18,15 @@ from .config import (
 )
 from .dhan_api import DhanClient
 from .engine import DhanAlgoEngine
-from .storage import read_json, read_jsonl, write_json
+from .storage import read_json, read_jsonl_from, write_json
 
 
 class ReconcileService:
     def __init__(self):
         self.engine = DhanAlgoEngine(enable_reconcile_workers=False, enable_snapshot_worker=False)
-        state = read_json(RECONCILE_COMMAND_STATE_FILE, {"processed": []})
+        state = read_json(RECONCILE_COMMAND_STATE_FILE, {})
         self.processed: set[str] = set(state.get("processed") or [])
+        self.command_offset = self._initial_command_offset(state)
         self.stopping = asyncio.Event()
         self.next_broker_run = 0.0
         self.next_candle_run = 0.0
@@ -55,7 +56,8 @@ class ReconcileService:
     async def _command_loop(self) -> None:
         while not self.stopping.is_set():
             try:
-                for command in read_jsonl(RECONCILE_COMMANDS_FILE):
+                commands, new_offset = read_jsonl_from(RECONCILE_COMMANDS_FILE, self.command_offset)
+                for command in commands:
                     command_id = str(command.get("id") or "")
                     if not command_id or command_id in self.processed:
                         continue
@@ -64,13 +66,32 @@ class ReconcileService:
                     except Exception as exc:
                         self.engine.event("ERROR", f"Reconcile command {command_id} failed: {exc}")
                     self._mark_processed(command_id)
+                self.command_offset = new_offset
+                self._save_command_state()
             except Exception as exc:
                 self.engine.event("ERROR", f"Reconcile command loop failed: {exc}")
             await asyncio.sleep(RECONCILE_COMMAND_POLL_SECONDS)
 
     def _mark_processed(self, command_id: str) -> None:
         self.processed.add(command_id)
-        write_json(RECONCILE_COMMAND_STATE_FILE, {"processed": sorted(self.processed)[-1000:]})
+        self._save_command_state()
+
+    def _initial_command_offset(self, state: dict[str, Any]) -> int:
+        if "offset" in state:
+            return int(state.get("offset") or 0)
+        try:
+            return RECONCILE_COMMANDS_FILE.stat().st_size
+        except OSError:
+            return 0
+
+    def _save_command_state(self) -> None:
+        write_json(
+            RECONCILE_COMMAND_STATE_FILE,
+            {
+                "offset": self.command_offset,
+                "processed": sorted(self.processed)[-200:],
+            },
+        )
 
     async def _handle_command(self, command: dict[str, Any]) -> None:
         action = str(command.get("action") or "").lower()

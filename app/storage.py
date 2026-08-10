@@ -54,3 +54,24 @@ def read_jsonl(path: Path) -> list[Any]:
             except json.JSONDecodeError:
                 continue
     return rows
+
+
+def read_jsonl_from(path: Path, offset: int = 0) -> tuple[list[Any], int]:
+    ensure_data_dir()
+    if not path.exists():
+        return [], 0
+    rows = []
+    with _LOCK:
+        size = path.stat().st_size
+        if offset < 0 or offset > size:
+            offset = 0
+        with path.open("r", encoding="utf-8", errors="ignore") as handle:
+            handle.seek(offset)
+            for line in handle:
+                if not line.strip():
+                    continue
+                try:
+                    rows.append(json.loads(line))
+                except json.JSONDecodeError:
+                    continue
+            return rows, handle.tell()

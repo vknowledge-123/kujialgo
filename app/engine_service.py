@@ -10,14 +10,15 @@ from typing import Any
 from .candles import IST
 from .config import ENGINE_COMMANDS_FILE, ENGINE_COMMAND_POLL_SECONDS, ENGINE_COMMAND_STATE_FILE, ENGINE_SNAPSHOT_INTERVAL_SECONDS, RUNTIME_SNAPSHOT_FILE
 from .engine import DhanAlgoEngine
-from .storage import read_json, read_jsonl, write_json
+from .storage import read_json, read_jsonl_from, write_json
 
 
 class EngineService:
     def __init__(self):
         self.engine = DhanAlgoEngine(enable_reconcile_workers=False, enable_snapshot_worker=False)
-        state = read_json(ENGINE_COMMAND_STATE_FILE, {"processed": []})
+        state = read_json(ENGINE_COMMAND_STATE_FILE, {})
         self.processed: set[str] = set(state.get("processed") or [])
+        self.command_offset = self._initial_command_offset(state)
         self.stopping = asyncio.Event()
 
     async def run(self) -> None:
@@ -37,7 +38,8 @@ class EngineService:
     async def _command_loop(self) -> None:
         while not self.stopping.is_set():
             try:
-                for command in read_jsonl(ENGINE_COMMANDS_FILE):
+                commands, new_offset = read_jsonl_from(ENGINE_COMMANDS_FILE, self.command_offset)
+                for command in commands:
                     command_id = str(command.get("id") or "")
                     if not command_id or command_id in self.processed:
                         continue
@@ -46,23 +48,43 @@ class EngineService:
                     except Exception as exc:
                         self.engine.event("ERROR", f"Engine command {command_id} failed: {exc}")
                     self._mark_processed(command_id)
+                self.command_offset = new_offset
+                self._save_command_state()
             except Exception as exc:
                 self.engine.event("ERROR", f"Engine command loop failed: {exc}")
             await asyncio.sleep(ENGINE_COMMAND_POLL_SECONDS)
 
     def _mark_processed(self, command_id: str) -> None:
         self.processed.add(command_id)
-        write_json(ENGINE_COMMAND_STATE_FILE, {"processed": sorted(self.processed)[-1000:]})
+        self._save_command_state()
+
+    def _initial_command_offset(self, state: dict[str, Any]) -> int:
+        if "offset" in state:
+            return int(state.get("offset") or 0)
+        try:
+            return ENGINE_COMMANDS_FILE.stat().st_size
+        except OSError:
+            return 0
+
+    def _save_command_state(self) -> None:
+        write_json(
+            ENGINE_COMMAND_STATE_FILE,
+            {
+                "offset": self.command_offset,
+                "processed": sorted(self.processed)[-200:],
+            },
+        )
 
     async def _handle_command(self, command: dict[str, Any]) -> None:
         action = str(command.get("action") or "").lower()
         payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
         if action == "config":
-            self.engine._load_state()
-            self.engine.configure(payload)
+            self._reload_config_from_state()
+            if payload:
+                self.engine.configure(payload)
             self.engine.event("INFO", "Config command applied by engine service.")
         elif action == "start":
-            self.engine._load_state()
+            self._reload_config_from_state()
             if payload:
                 self.engine.configure(payload)
             await self.engine.start()
@@ -70,6 +92,13 @@ class EngineService:
             await self.engine.stop()
         else:
             self.engine.event("WARN", f"Unknown engine command ignored: {action}")
+
+    def _reload_config_from_state(self) -> None:
+        old_security_ids = set(self.engine.instruments_by_security)
+        self.engine._load_state()
+        self.engine._resolve_watchlists()
+        if self.engine.running and set(self.engine.instruments_by_security) != old_security_ids:
+            self.engine._restart_market_feed_threads()
 
     async def _snapshot_loop(self) -> None:
         while not self.stopping.is_set():

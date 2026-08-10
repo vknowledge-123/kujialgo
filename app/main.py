@@ -27,8 +27,8 @@ def status():
 def configure(payload: dict = Body(...)):
     try:
         save_runtime_config(payload)
-        queue_command("engine", "config", payload)
-        queue_command("reconcile", "config", payload)
+        queue_command("engine", "config", {})
+        queue_command("reconcile", "config", {})
         return read_status_snapshot()
     except Exception as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -39,8 +39,8 @@ def start_algo(payload: dict = Body(default={})):
     try:
         if payload:
             save_runtime_config(payload)
-            queue_command("reconcile", "config", payload)
-        queue_command("engine", "start", payload)
+            queue_command("reconcile", "config", {})
+        queue_command("engine", "start", {})
         snapshot = read_status_snapshot()
         snapshot["running"] = True
         snapshot["market_connecting"] = not bool(snapshot.get("market_connected"))
@@ -69,8 +69,8 @@ def premarket_cache(payload: dict = Body(default={})):
     try:
         if payload:
             save_runtime_config(payload)
-            queue_command("engine", "config", payload)
-        queue_command("reconcile", "premarket-cache", payload)
+            queue_command("engine", "config", {})
+        queue_command("reconcile", "premarket-cache", {"force": bool(payload.get("force", False))})
         snapshot = read_status_snapshot()
         snapshot.setdefault("premarket", {})["message"] = "Premarket cache command queued for reconcile service."
         return snapshot
