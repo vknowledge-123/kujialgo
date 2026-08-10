@@ -10,6 +10,7 @@ const state = {
   settingsDirty: false,
   listsDirty: false,
   dirtyVersion: 0,
+  polling: false,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -56,19 +57,28 @@ function payload(options = {}) {
 }
 
 async function api(path, options = {}) {
-  const res = await fetch(path, {
-    headers: { "Content-Type": "application/json" },
-    ...options,
-  });
-  const text = await res.text();
-  let data = {};
+  const { timeoutMs: rawTimeoutMs, ...fetchOptions } = options;
+  const controller = new AbortController();
+  const timeoutMs = Number(rawTimeoutMs || 12000);
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
   try {
-    data = text ? JSON.parse(text) : {};
-  } catch (_err) {
-    data = { detail: text || res.statusText || "Request failed" };
+    const res = await fetch(path, {
+      headers: { "Content-Type": "application/json" },
+      ...fetchOptions,
+      signal: controller.signal,
+    });
+    const text = await res.text();
+    let data = {};
+    try {
+      data = text ? JSON.parse(text) : {};
+    } catch (_err) {
+      data = { detail: text || res.statusText || "Request failed" };
+    }
+    if (!res.ok) throw new Error(data.detail || "Request failed");
+    return data;
+  } finally {
+    clearTimeout(timer);
   }
-  if (!res.ok) throw new Error(data.detail || "Request failed");
-  return data;
 }
 
 function td(value) {
@@ -108,12 +118,12 @@ function scheduleSave(delay = 350, options = {}) {
 }
 
 async function refreshCounts() {
-  const universe = await api("/api/extract-symbols", { method: "POST", body: JSON.stringify({ text: $("universeText").value }) });
+  const universe = await api("/api/extract-symbols", { method: "POST", body: JSON.stringify({ text: $("universeText").value }), timeoutMs: 5000 });
   state.universe = universe.symbols;
   $("universeCount").textContent = universe.symbols.length;
-  const long = await api("/api/extract-symbols", { method: "POST", body: JSON.stringify({ text: $("longText").value, universe: state.universe }) });
+  const long = await api("/api/extract-symbols", { method: "POST", body: JSON.stringify({ text: $("longText").value }), timeoutMs: 5000 });
   $("longCount").textContent = long.symbols.length;
-  const short = await api("/api/extract-symbols", { method: "POST", body: JSON.stringify({ text: $("shortText").value, universe: state.universe }) });
+  const short = await api("/api/extract-symbols", { method: "POST", body: JSON.stringify({ text: $("shortText").value }), timeoutMs: 5000 });
   $("shortCount").textContent = short.symbols.length;
 }
 
@@ -407,7 +417,12 @@ $("brokerReconcile").addEventListener("click", async () => {
 });
 
 async function poll() {
-  try { render(await api("/api/status")); } catch (_err) {}
+  if (state.polling) return;
+  state.polling = true;
+  try { render(await api("/api/status", { timeoutMs: 5000 })); } catch (_err) {
+  } finally {
+    state.polling = false;
+  }
 }
 
 poll();

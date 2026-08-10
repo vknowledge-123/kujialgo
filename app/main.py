@@ -68,8 +68,7 @@ def premarket_report():
 
 @app.post("/api/extract-symbols")
 def parse_symbols(payload: dict = Body(...)):
-    universe = set(payload.get("universe") or [])
-    return {"symbols": extract_symbols(payload.get("text") or "", universe if universe else None)}
+    return {"symbols": extract_symbols(payload.get("text") or "")}
 
 
 @app.post("/api/reconcile/{symbol}")

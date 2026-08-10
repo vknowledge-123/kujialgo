@@ -737,9 +737,9 @@ class DhanAlgoEngine:
             if "universe_text" in payload:
                 self.universe_symbols = set(extract_symbols(payload.get("universe_text") or ""))
             if "long_text" in payload:
-                self.long_symbols = extract_symbols(payload.get("long_text") or "", self.universe_symbols)
+                self.long_symbols = extract_symbols(payload.get("long_text") or "")
             if "short_text" in payload:
-                self.short_symbols = extract_symbols(payload.get("short_text") or "", self.universe_symbols)
+                self.short_symbols = extract_symbols(payload.get("short_text") or "")
             self._resolve_watchlists()
             if self.running and set(self.instruments_by_security) != old_security_ids:
                 self._restart_market_feed_threads()
