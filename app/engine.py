@@ -10,7 +10,7 @@ from uuid import uuid4
 
 import websockets
 
-from .candles import CandleStore, IST, SESSION_OPEN, expected_starts_for_day, to_ist
+from .candles import CandleStore, IST, SESSION_OPEN, expected_starts_for_day, floor_timeframe, to_ist
 from .config import (
     ALLOW_POSITIONS_ONLY_RECONCILE,
     BROKER_ORDER_BOOK_TIMEOUT_SECONDS,
@@ -636,6 +636,7 @@ class DhanAlgoEngine:
                 rows = frames.get(str(timeframe)) or []
                 if rows:
                     self.candles.seed_history(instrument, timeframe, rows)
+            self._mark_reconciled_day_history(instrument, frames.get("1") or [])
         self.last_reconciled_candle_load = updated_at
 
     def _extract_error_message(self, payload: Any) -> str:
@@ -1248,8 +1249,6 @@ class DhanAlgoEngine:
         return symbol in self.reconciled_day_history
 
     def _mark_reconciled_day_history(self, instrument: Instrument, rows: list[dict[str, Any]], as_of: datetime | None = None) -> None:
-        if not rows:
-            return
         now = as_of or datetime.now(IST)
         session_open_dt = now.replace(
             hour=SESSION_OPEN.hour,
@@ -1262,6 +1261,19 @@ class DhanAlgoEngine:
             if timestamp and to_ist(timestamp).replace(second=0, microsecond=0) == session_open_dt:
                 self.reconciled_day_history.add(instrument.symbol)
                 return
+        one_minute_open_label = session_open_dt + timedelta(minutes=1)
+        one_minute_has_opening = False
+        for candle in self.candles.closed_candles(instrument.symbol, 1):
+            start = to_ist(candle.start)
+            if start.date() == now.date() and session_open_dt <= start <= one_minute_open_label:
+                one_minute_has_opening = True
+                break
+        five_minute_has_opening = any(
+            to_ist(candle.start).date() == now.date() and to_ist(candle.start) == session_open_dt
+            for candle in self.candles.closed_candles(instrument.symbol, 5)
+        )
+        if one_minute_has_opening and five_minute_has_opening:
+            self.reconciled_day_history.add(instrument.symbol)
 
     def _day_extremes_until(self, symbol: str, price: float, timestamp: datetime) -> tuple[float, float]:
         session_open_dt = timestamp.replace(
@@ -2950,12 +2962,39 @@ class DhanAlgoEngine:
             ]
             missing = [dt for dt in expected if dt not in existing]
             if missing:
-                rows = await self.client.intraday(instrument.security_id, timeframe, min(missing), now)
+                fetch_from = self._intraday_reconcile_fetch_from(timeframe, missing, now)
+                rows = await self.client.intraday(instrument.security_id, timeframe, fetch_from, now)
+                rows = self._market_session_candle_rows(rows, timeframe)
                 self.candles.seed_history(instrument, timeframe, rows)
                 if timeframe == 1:
                     self._mark_reconciled_day_history(instrument, rows, now)
             result[str(timeframe)] = len(missing)
+        self._mark_reconciled_day_history(instrument, [], now)
         return result
+
+    def _intraday_reconcile_fetch_from(self, timeframe: int, missing: list[datetime], now: datetime) -> datetime:
+        fetch_from = min(missing)
+        if timeframe == 1:
+            session_open_dt = now.replace(
+                hour=SESSION_OPEN.hour,
+                minute=SESSION_OPEN.minute,
+                second=0,
+                microsecond=0,
+            )
+            if any(dt == session_open_dt for dt in missing):
+                return session_open_dt - timedelta(minutes=1)
+        return fetch_from
+
+    def _market_session_candle_rows(self, rows: list[dict[str, Any]], timeframe: int) -> list[dict[str, Any]]:
+        filtered = []
+        for row in rows:
+            raw_timestamp = to_ist(row.get("timestamp"))
+            if raw_timestamp.time() < SESSION_OPEN:
+                continue
+            start = floor_timeframe(raw_timestamp, timeframe)
+            if start.time() >= SESSION_OPEN:
+                filtered.append(row)
+        return filtered
 
     def _previous_day(self, symbol: str) -> dict[str, float]:
         cache = self._premarket_cache()
