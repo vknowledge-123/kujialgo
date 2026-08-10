@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Koju Dhan Algo</title>
-  <link rel="stylesheet" href="/static/app.css?v=20260810-services">
+  <link rel="stylesheet" href="/static/app.css?v=20260810-auto-square">
 </head>
 <body>
   <main class="shell">
@@ -52,12 +52,14 @@
           <label>Scalper SL % <input id="scalperSl" type="number" min="0.1" step="0.1" value="0.8"></label>
           <label>Risk reward <input id="riskReward" type="number" min="0.1" step="0.1" value="3"></label>
           <label>Pyramid max adds <input id="scalperMaxAdds" type="number" min="0" step="1" value="2"></label>
+          <label>Auto square time <input id="autoSquareTime" type="time" value="15:09"></label>
         </div>
         <div class="toggles">
           <label><input id="dryRun" type="checkbox" checked> Dry run</label>
           <label><input id="capitalSizing" name="sizingMode" type="radio" checked> Capital sizing</label>
           <label><input id="riskSizing" name="sizingMode" type="radio"> Risk sizing</label>
           <label><input id="scalperPyramiding" type="checkbox"> Scalper pyramiding</label>
+          <label><input id="autoSquareEnabled" type="checkbox" checked> Auto square-off</label>
           <label><input id="sectorFilter" type="checkbox"> Sector filter</label>
           <label>Top sectors <input id="topSectorCount" type="number" min="1" value="2"></label>
         </div>
@@ -166,6 +168,6 @@
       </div>
     </section>
   </main>
-  <script src="/static/app.js?v=20260810-services"></script>
+  <script src="/static/app.js?v=20260810-auto-square"></script>
 </body>
 </html>

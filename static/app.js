@@ -41,6 +41,8 @@ function payload(options = {}) {
       scalper_sl_percent: Number($("scalperSl").value || 0.8),
       scalper_pyramiding: $("scalperPyramiding").checked,
       scalper_max_adds: Number($("scalperMaxAdds").value || 2),
+      auto_square_enabled: $("autoSquareEnabled").checked,
+      auto_square_time: $("autoSquareTime").value || "15:09",
       risk_reward: Number($("riskReward").value || 3),
       use_sector_filter: $("sectorFilter").checked,
       top_sector_count: Number($("topSectorCount").value || 2),
@@ -208,9 +210,11 @@ function render(data) {
     setInputValue("scalperSl", data.settings.scalper_sl_percent || 0.8);
     setInputValue("riskReward", data.settings.risk_reward || 3);
     setInputValue("scalperMaxAdds", data.settings.scalper_max_adds ?? 2);
+    setInputValue("autoSquareTime", data.settings.auto_square_time || "15:09");
     setInputValue("topSectorCount", data.settings.top_sector_count || 2);
     $("dryRun").checked = Boolean(data.settings.dry_run);
     $("scalperPyramiding").checked = Boolean(data.settings.scalper_pyramiding);
+    $("autoSquareEnabled").checked = data.settings.auto_square_enabled !== false;
     $("sectorFilter").checked = Boolean(data.settings.use_sector_filter);
     document.querySelectorAll(".strategy").forEach((input) => {
       input.checked = Boolean((data.settings.enabled || {})[input.dataset.key]);
@@ -370,12 +374,12 @@ document.querySelectorAll(".tf").forEach((button) => {
   });
 });
 
-["perTradeCapital", "perTradeRisk", "smaPeriod", "nearHigh", "volumeMultiplier", "fixedSl", "scalperSl", "riskReward", "scalperMaxAdds", "topSectorCount"].forEach((id) => {
+["perTradeCapital", "perTradeRisk", "smaPeriod", "nearHigh", "volumeMultiplier", "fixedSl", "scalperSl", "riskReward", "scalperMaxAdds", "autoSquareTime", "topSectorCount"].forEach((id) => {
   $(id).addEventListener("input", () => scheduleSave(400));
   $(id).addEventListener("change", () => scheduleSave(0));
 });
 
-["dryRun", "scalperPyramiding", "sectorFilter"].forEach((id) => {
+["dryRun", "scalperPyramiding", "autoSquareEnabled", "sectorFilter"].forEach((id) => {
   $(id).addEventListener("change", () => scheduleSave(0));
 });
 

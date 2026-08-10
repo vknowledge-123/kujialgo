@@ -22,6 +22,8 @@ class StrategySettings:
     scalper_sl_percent: float = 0.8
     scalper_pyramiding: bool = False
     scalper_max_adds: int = 2
+    auto_square_enabled: bool = True
+    auto_square_time: str = "15:09"
     candle_sl_max_percent: float = 1.0
     risk_reward: float = 3.0
     ema_period: int = 10
@@ -62,6 +64,8 @@ class StrategySettings:
             scalper_sl_percent=max(0.1, float(payload.get("scalper_sl_percent") or current.scalper_sl_percent)),
             scalper_pyramiding=bool(payload.get("scalper_pyramiding", current.scalper_pyramiding)),
             scalper_max_adds=max(0, int(payload.get("scalper_max_adds") if payload.get("scalper_max_adds") is not None else current.scalper_max_adds)),
+            auto_square_enabled=bool(payload.get("auto_square_enabled", current.auto_square_enabled)),
+            auto_square_time=normalize_time_setting(payload.get("auto_square_time") or current.auto_square_time, current.auto_square_time),
             candle_sl_max_percent=float(payload.get("candle_sl_max_percent") or current.candle_sl_max_percent),
             risk_reward=max(0.1, float(payload.get("risk_reward") or current.risk_reward)),
             ema_period=max(1, int(payload.get("ema_period") or current.ema_period)),
@@ -69,6 +73,19 @@ class StrategySettings:
             top_sector_count=max(1, int(payload.get("top_sector_count") or current.top_sector_count)),
             enabled=enabled,
         )
+
+
+def normalize_time_setting(value: Any, default: str) -> str:
+    text = str(value or "").strip()
+    try:
+        hour_text, minute_text = text.split(":", 1)
+        hour = int(hour_text)
+        minute = int(minute_text[:2])
+        if 0 <= hour <= 23 and 0 <= minute <= 59:
+            return f"{hour:02d}:{minute:02d}"
+    except (TypeError, ValueError):
+        pass
+    return default
 
 
 def volume_sma(baseline: list[int], period: int) -> float:

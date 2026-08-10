@@ -356,6 +356,7 @@ class DhanAlgoEngine:
         self.feed_sockets: list[Any] = []
         self.order_task: asyncio.Task | None = None
         self.tick_task: asyncio.Task | None = None
+        self.auto_square_task: asyncio.Task | None = None
         self.execution_task: asyncio.Task | None = None
         self.execution_tasks: set[asyncio.Task] = set()
         self.snapshot_task: asyncio.Task | None = None
@@ -382,6 +383,8 @@ class DhanAlgoEngine:
         self.positions: dict[str, Position] = {}
         self.scalper_state: dict[str, dict[str, Any]] = {}
         self.reconciled_day_history: set[str] = set()
+        self.auto_square_done_date = ""
+        self.auto_square_notice_date = ""
         self.ledger: dict[str, Any] = _empty_ledger()
         self.locked_symbols: set[str] = set()
         self.external_locked_symbols: set[str] = set()
@@ -763,7 +766,7 @@ class DhanAlgoEngine:
             current = asyncio.current_task()
         except RuntimeError:
             current = None
-        for task in (self.tick_task, self.order_task, self.execution_task, self.snapshot_task, self.reconcile_task, self.broker_reconcile_task, *list(self.execution_tasks), *list(self.action_tasks)):
+        for task in (self.tick_task, self.order_task, self.auto_square_task, self.execution_task, self.snapshot_task, self.reconcile_task, self.broker_reconcile_task, *list(self.execution_tasks), *list(self.action_tasks)):
             if task and task is not current and not task.done():
                 task.cancel()
 
@@ -860,6 +863,7 @@ class DhanAlgoEngine:
         self.order_connecting = True
         self.order_last_error = ""
         self.tick_task = asyncio.create_task(self._tick_worker())
+        self.auto_square_task = asyncio.create_task(self._auto_square_worker())
         self.execution_tasks = {asyncio.create_task(self._execution_worker()) for _ in range(max(1, EXECUTION_WORKER_COUNT))}
         self.execution_task = next(iter(self.execution_tasks))
         if self.enable_snapshot_worker:
@@ -880,12 +884,13 @@ class DhanAlgoEngine:
         self.order_connected = False
         self.order_connecting = False
         self._close_market_feed_sockets()
-        for task in (self.tick_task, self.order_task, self.execution_task, self.snapshot_task, self.reconcile_task, self.broker_reconcile_task, *list(self.execution_tasks), *list(self.action_tasks)):
+        for task in (self.tick_task, self.order_task, self.auto_square_task, self.execution_task, self.snapshot_task, self.reconcile_task, self.broker_reconcile_task, *list(self.execution_tasks), *list(self.action_tasks)):
             if task:
                 task.cancel()
         self.execution_queue = None
         self.execution_tasks = set()
         self.execution_task = None
+        self.auto_square_task = None
         self.symbol_action_locks = {}
         self.snapshot_task = None
         self.pending_actions.clear()
@@ -1054,6 +1059,8 @@ class DhanAlgoEngine:
             position.last_price = price
             if position.strategy in {"scalper_long", "scalper_short"}:
                 self._schedule_scalper_management(position, instrument, price)
+        if self._entries_closed_for_auto_square(timestamp):
+            return
         await self._evaluate_scalper_tick(instrument, price, timestamp)
         if self._is_symbol_locked(symbol):
             return
@@ -1086,6 +1093,8 @@ class DhanAlgoEngine:
                         lambda position=position, reason=reason: self._exit_position(position, reason),
                         priority=0,
                     )
+        if self._entries_closed_for_auto_square(candle.start):
+            return
         if symbol not in self.long_symbols or self._has_open_position(symbol):
             return
         if self._is_symbol_locked(symbol):
@@ -1102,6 +1111,9 @@ class DhanAlgoEngine:
                 )
 
     async def _enter_position(self, instrument: Instrument, signal: dict[str, Any]) -> None:
+        if self._entries_closed_for_auto_square():
+            self.event("WARN", f"{instrument.symbol} entry skipped: auto square-off time has passed.")
+            return
         if self._is_symbol_locked(instrument.symbol):
             self.event("WARN", f"{instrument.symbol} entry blocked: {self._entry_block_reason(instrument.symbol)}.")
             return
@@ -1296,6 +1308,9 @@ class DhanAlgoEngine:
         return max(highs), min(lows)
 
     async def _enter_scalper_position(self, instrument: Instrument, side: str, entry: float, reason: str) -> bool:
+        if self._entries_closed_for_auto_square():
+            self.event("WARN", f"{instrument.symbol} scalper {side.lower()} skipped: auto square-off time has passed.")
+            return False
         if self._is_symbol_locked(instrument.symbol):
             self.event("WARN", f"{instrument.symbol} scalper {side.lower()} blocked: {self._entry_block_reason(instrument.symbol)}.")
             return False
@@ -1393,6 +1408,8 @@ class DhanAlgoEngine:
         if reason:
             await self._exit_position(position, reason)
             return
+        if self._entries_closed_for_auto_square():
+            return
         self._trail_scalper_to_breakeven(position, price)
         await self._maybe_pyramid_scalper(position, instrument, price)
 
@@ -1406,6 +1423,8 @@ class DhanAlgoEngine:
                 lambda position=position, reason=reason: self._exit_position(position, reason),
                 priority=0,
             )
+            return
+        if self._entries_closed_for_auto_square():
             return
         self._trail_scalper_to_breakeven(position, price)
         if self._scalper_pyramid_due(position, price):
@@ -3164,6 +3183,55 @@ class DhanAlgoEngine:
             except Exception as exc:
                 self.event("ERROR", f"Snapshot refresh failed: {exc}")
             await asyncio.sleep(1.0)
+
+    async def _auto_square_worker(self) -> None:
+        while self.running:
+            try:
+                await self._maybe_auto_square_off(datetime.now(IST))
+            except Exception as exc:
+                self.event("ERROR", f"Auto square-off check failed: {exc}")
+            await asyncio.sleep(1.0)
+
+    async def _maybe_auto_square_off(self, now: datetime) -> None:
+        if not self._entries_closed_for_auto_square(now):
+            return
+        today = to_ist(now).date().isoformat()
+        if self.auto_square_done_date == today:
+            return
+        open_positions = [position for position in self.positions.values() if position.status == "OPEN"]
+        if not open_positions:
+            self.event("INFO", f"Auto square-off checked at {self.settings.auto_square_time}; no open algo positions.")
+            self.auto_square_done_date = today
+            return
+        if self.auto_square_notice_date != today:
+            self.event("WARN", f"Auto square-off triggered at {self.settings.auto_square_time}; exiting {len(open_positions)} open algo positions.")
+            self.auto_square_notice_date = today
+        for position in open_positions:
+            self._schedule_action(
+                f"EXIT:{position.symbol}:{position.side}:AUTO_SQUARE",
+                lambda position=position: self._exit_position(position, "AUTO_SQUARE_OFF"),
+                priority=-10,
+            )
+
+    def _entries_closed_for_auto_square(self, now: datetime | None = None) -> bool:
+        if not self.settings.auto_square_enabled:
+            return False
+        hour, minute = self._auto_square_time_parts()
+        current = to_ist(now)
+        square_at = current.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        return current >= square_at
+
+    def _auto_square_time_parts(self) -> tuple[int, int]:
+        text = str(self.settings.auto_square_time or "15:09")
+        try:
+            hour_text, minute_text = text.split(":", 1)
+            hour = int(hour_text)
+            minute = int(minute_text[:2])
+            if 0 <= hour <= 23 and 0 <= minute <= 59:
+                return hour, minute
+        except (TypeError, ValueError):
+            pass
+        return 15, 9
 
     def _refresh_snapshot_cache(self) -> dict[str, Any]:
         snapshot = self._build_snapshot()
