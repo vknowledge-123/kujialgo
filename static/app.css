@@ -42,6 +42,7 @@ p { margin: 6px 0 0; color: var(--muted); }
   font-weight: 700;
 }
 .pill.muted { color: var(--muted); background: #fff; }
+.pill.warn { color: var(--warn); background: #fff9eb; }
 .pill.bad { color: var(--danger); background: #fff4f2; }
 .controls, .watchlists, .live-grid, .cache-report-section {
   display: grid;

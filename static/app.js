@@ -129,8 +129,9 @@ function render(data) {
   $("runState").className = data.running ? "pill" : "pill bad";
   $("feedState").textContent = data.market_connected ? "Feed Live" : "Feed Off";
   $("feedState").className = data.market_connected ? "pill" : "pill muted";
-  $("orderState").textContent = data.order_connected ? "Orders Live" : (data.order_last_error ? "Orders Reconnecting" : "Orders Off");
-  $("orderState").className = data.order_connected ? "pill" : "pill muted";
+  const orderFallback = Boolean(data.order_last_error && String(data.order_last_error).includes("fallback"));
+  $("orderState").textContent = data.order_connected ? "Orders Live" : (orderFallback ? "Orders Fallback" : (data.order_last_error ? "Orders Reconnecting" : "Orders Off"));
+  $("orderState").className = data.order_connected ? "pill" : (orderFallback ? "pill warn" : "pill muted");
   renderBrokerAlert(data.broker_reconcile || {});
 
   $("positions").innerHTML = (data.positions || []).map((p) => `

@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import json
 import struct
 import threading
@@ -24,6 +25,11 @@ from .config import (
     MAX_INSTRUMENTS_PER_CONNECTION,
     MAX_MARKET_FEED_CONNECTIONS,
     MAX_SUBSCRIBE_BATCH,
+    ORDER_SOCKET_OPEN_TIMEOUT_SECONDS,
+    ORDER_SOCKET_PING_INTERVAL_SECONDS,
+    ORDER_SOCKET_PING_TIMEOUT_SECONDS,
+    ORDER_SOCKET_RECONNECT_BASE_SECONDS,
+    ORDER_SOCKET_RECONNECT_MAX_SECONDS,
     PREMARKET_FILE,
     PREMARKET_REPORT_FILE,
     STATE_FILE,
@@ -1860,13 +1866,18 @@ class DhanAlgoEngine:
         while self.running and self.credentials.get("client_id") and self.credentials.get("access_token"):
             connected_at = 0.0
             try:
-                async with websockets.connect(
-                    DHAN_ORDER_UPDATE_URL,
-                    ping_interval=20,
-                    ping_timeout=10,
-                    open_timeout=10,
-                    close_timeout=3,
-                ) as ws:
+                connect_kwargs = {
+                    "ping_interval": ORDER_SOCKET_PING_INTERVAL_SECONDS,
+                    "ping_timeout": ORDER_SOCKET_PING_TIMEOUT_SECONDS,
+                    "open_timeout": ORDER_SOCKET_OPEN_TIMEOUT_SECONDS,
+                    "close_timeout": 5,
+                    "compression": None,
+                    "max_queue": None,
+                    "user_agent_header": "KojuDhanAlgo/1.0",
+                }
+                if "proxy" in inspect.signature(websockets.connect).parameters:
+                    connect_kwargs["proxy"] = None
+                async with websockets.connect(DHAN_ORDER_UPDATE_URL, **connect_kwargs) as ws:
                     connected_at = time.monotonic()
                     await ws.send(json.dumps({"LoginReq": {"MsgCode": 42, "ClientId": self.credentials["client_id"], "Token": self.credentials["access_token"]}, "UserType": "SELF"}))
                     self.order_connected = True
@@ -1901,10 +1912,10 @@ class DhanAlgoEngine:
                 if connected_at and time.monotonic() - connected_at >= 30:
                     self.order_reconnects = 0
                 self.order_reconnects += 1
-                self.order_last_error = f"Order update socket reconnecting: {exc}"
+                self.order_last_error = f"Order update socket reconnecting: {exc}. REST order book/trade book fallback remains active."
                 if self.order_reconnects == 1 or self.order_reconnects % 10 == 0:
                     self.event("INFO", self.order_last_error)
-                await asyncio.sleep(min(30, 3 + self.order_reconnects))
+                await asyncio.sleep(min(ORDER_SOCKET_RECONNECT_MAX_SECONDS, ORDER_SOCKET_RECONNECT_BASE_SECONDS + self.order_reconnects))
 
     async def _broker_reconcile_worker(self) -> None:
         while self.running:
