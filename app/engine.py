@@ -1261,7 +1261,7 @@ class DhanAlgoEngine:
             microsecond=0,
         )
         for row in rows:
-            timestamp = row.get("timestamp")
+            timestamp = row.get("timestamp") or row.get("start") or row.get("time")
             if timestamp and to_ist(timestamp).replace(second=0, microsecond=0) == session_open_dt:
                 self.reconciled_day_history.add(instrument.symbol)
                 return

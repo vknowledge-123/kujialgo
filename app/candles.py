@@ -53,7 +53,10 @@ class CandleStore:
     def seed_history(self, instrument: Instrument, timeframe: int, rows: list[dict]) -> None:
         key = (instrument.symbol, timeframe)
         for row in rows:
-            start = floor_timeframe(to_ist(row.get("timestamp")), timeframe)
+            timestamp = row.get("timestamp") or row.get("start") or row.get("time")
+            if not timestamp:
+                continue
+            start = floor_timeframe(to_ist(timestamp), timeframe)
             candle = Candle(
                 symbol=instrument.symbol,
                 security_id=instrument.security_id,
